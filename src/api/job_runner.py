@@ -4,13 +4,19 @@ Kubernetes Job runner for RCA worker pods.
 Creates, monitors, cancels and cleans up batch/v1 Job resources that execute
 the ``worker.py`` entrypoint inside the pre-built RCA image.
 
-All file I/O between the API pod and worker pods happens through a shared
-ReadWriteMany PVC mounted at ``SHARED_PVC_MOUNT`` (default ``/shared``).
+Supports two modes controlled by ``JOBS_CLUSTER_MODE``:
+
+- ``disabled`` (default) — single-cluster mode.  All data exchange happens
+  through a shared PVC mounted at ``SHARED_PVC_MOUNT``.
+- ``enabled`` — cross-cluster mode.  Jobs run in ephemeral namespaces on a
+  remote cluster.  Data flows through the API (GCS-backed for large archives,
+  HTTP callbacks for status/results).
 """
 
 import json
 import logging
 import os
+import secrets as _secrets
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -37,6 +43,10 @@ WORKER_CPU_REQUEST: str = os.environ.get("WORKER_CPU_REQUEST", "250m")
 WORKER_CPU_LIMIT: str = os.environ.get("WORKER_CPU_LIMIT", "2000m")
 WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "512Mi")
 WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
+
+JOBS_CLUSTER_MODE: str = os.environ.get("JOBS_CLUSTER_MODE", "disabled")
+LOCAL_SESSION_DIR: str = os.environ.get("LOCAL_SESSION_DIR", "/data/sessions")
+API_CALLBACK_URL: str = os.environ.get("API_CALLBACK_URL", "")
 
 # ---------------------------------------------------------------------------
 # K8s client initialisation (lazy, once)
@@ -67,9 +77,18 @@ def _job_name(session_id: str) -> str:
     return name[:63]
 
 
+def _is_remote() -> bool:
+    return JOBS_CLUSTER_MODE == "enabled"
+
+
 def _job_dir_on_pvc(session_id: str) -> str:
     """Return the path on the shared PVC for this job."""
     return f"{SHARED_PVC_MOUNT}/jobs/{session_id}"
+
+
+def _job_dir_local(session_id: str) -> str:
+    """Return the local session directory for cross-cluster mode."""
+    return f"{LOCAL_SESSION_DIR}/jobs/{session_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +96,9 @@ def _job_dir_on_pvc(session_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_job_dir(session_id: str) -> Path:
-    """Return the local mount path for the job's directory on the shared PVC."""
+    """Return the job directory — local storage in remote mode, PVC in local mode."""
+    if _is_remote():
+        return Path(_job_dir_local(session_id))
     return Path(_job_dir_on_pvc(session_id))
 
 
@@ -86,12 +107,24 @@ def create_analysis_job(
     user_query: str,
     must_gather_base_dir: str,
     owner: str = "",
+    archive_local_path: Path | None = None,
 ) -> str:
     """Create a K8s Job that runs ``worker.py`` in analyze mode.
 
+    In remote mode, *archive_local_path* is uploaded to GCS first, and the
+    worker downloads it from the API at runtime.
+
     Returns the Job name.
     """
-    return _create_job(
+    if _is_remote():
+        return _create_remote_analysis_job(
+            session_id=session_id,
+            user_query=user_query,
+            archive_local_path=archive_local_path,
+            owner=owner,
+        )
+
+    return _create_local_job(
         session_id=session_id,
         env_extras=[
             client.V1EnvVar(name="USER_QUERY", value=user_query),
@@ -129,9 +162,17 @@ def create_deepening_job(
             pass
     _write_status_file(job_dir, {"deepening_round": prev_round + 1})
 
+    if _is_remote():
+        return _create_remote_deepening_job(
+            session_id=session_id,
+            orch_session_id=orch_session_id,
+            feedback_text=feedback_text,
+            owner=owner,
+        )
+
     _delete_existing_job(session_id)
 
-    return _create_job(
+    return _create_local_job(
         session_id=session_id,
         env_extras=[
             client.V1EnvVar(name="MODE", value="deepening"),
@@ -145,22 +186,28 @@ def create_deepening_job(
 
 
 def get_job_status(session_id: str) -> dict:
-    """Read status.json from the shared PVC for this session.
+    """Read status.json for this session.
 
+    In remote mode, status.json is populated by callback handlers.
     Falls back to the K8s Job phase when status.json is missing or stale.
     """
     status_file = get_job_dir(session_id) / "status.json"
     status: dict = {}
     if status_file.exists():
         try:
-            status = json.loads(status_file.read_text(encoding="utf-8"))
+            raw = json.loads(status_file.read_text(encoding="utf-8"))
+            status = {k: v for k, v in raw.items() if not k.startswith("_")}
         except Exception:
             pass
 
     if status.get("status") in ("completed", "error"):
         return status
 
-    k8s_phase = _k8s_job_phase(session_id)
+    if _is_remote():
+        k8s_phase = _remote_job_phase(session_id)
+    else:
+        k8s_phase = _k8s_job_phase(session_id)
+
     if k8s_phase == "failed" and status.get("status") != "error":
         status.update({"status": "error", "message": "Worker pod failed unexpectedly"})
     elif not status:
@@ -176,6 +223,32 @@ def get_job_status(session_id: str) -> dict:
 
 def cancel_job(session_id: str) -> dict:
     """Delete the K8s Job (cascading) to terminate the worker pod."""
+    job_dir = get_job_dir(session_id)
+
+    if _is_remote():
+        import remote_cluster
+        import object_storage
+
+        ns = remote_cluster.get_namespace_for_session(session_id)
+        if ns:
+            name = _job_name(session_id)
+            try:
+                remote_cluster.delete_job(ns, name)
+            except Exception:
+                pass
+            remote_cluster.release_namespace(session_id)
+        try:
+            object_storage.delete_session_objects(session_id)
+        except Exception:
+            pass
+
+        _write_status_file(job_dir, {
+            "session_id": session_id,
+            "status": "cancelled",
+            "message": "Analysis cancelled by user",
+        })
+        return {"status": "cancelled", "session_id": session_id}
+
     _init_k8s()
     name = _job_name(session_id)
     try:
@@ -184,7 +257,6 @@ def cancel_job(session_id: str) -> dict:
             namespace=NAMESPACE,
             body=client.V1DeleteOptions(propagation_policy="Foreground"),
         )
-        job_dir = get_job_dir(session_id)
         _write_status_file(job_dir, {
             "session_id": session_id,
             "status": "cancelled",
@@ -198,9 +270,26 @@ def cancel_job(session_id: str) -> dict:
 
 
 def cleanup_job(session_id: str) -> None:
-    """Delete the K8s Job resource and remove ALL job data from the PVC."""
-    _init_k8s()
-    _delete_k8s_job_resource(session_id)
+    """Delete the K8s Job resource and remove ALL job data."""
+    if _is_remote():
+        import remote_cluster
+        import object_storage
+
+        ns = remote_cluster.get_namespace_for_session(session_id)
+        if ns:
+            try:
+                remote_cluster.delete_job(ns, _job_name(session_id))
+            except Exception:
+                pass
+            remote_cluster.release_namespace(session_id)
+        try:
+            object_storage.delete_session_objects(session_id)
+        except Exception:
+            pass
+    else:
+        _init_k8s()
+        _delete_k8s_job_resource(session_id)
+
     job_dir = get_job_dir(session_id)
     if job_dir.exists():
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -233,63 +322,50 @@ def _delete_k8s_job_resource(session_id: str) -> None:
             logger.warning("Failed to delete Job %s: %s", name, exc)
 
 
-def list_active_jobs() -> list[dict]:
-    """Return a list of currently active (running) jobs."""
-    _init_k8s()
-    try:
-        jobs = _batch_v1.list_namespaced_job(
-            namespace=NAMESPACE,
-            label_selector="app=rca-worker",
-        )
-    except ApiException:
-        return []
-
-    active = []
-    for job in jobs.items:
-        if job.status.active:
-            sid = (job.metadata.labels or {}).get("session-id", "")
-            active.append({
-                "job_name": job.metadata.name,
-                "session_id": sid,
-                "start_time": job.status.start_time.isoformat() if job.status.start_time else None,
-            })
-    return active
-
-
 def list_all_jobs(owner: str | None = None) -> list[dict]:
-    """Return every session — from live K8s Jobs AND from PVC status files.
+    """Return every session — from live K8s Jobs AND from status files.
 
-    K8s Jobs are auto-deleted after TTL, but status.json files on the PVC
-    persist.  This ensures the Portal jobs board keeps showing completed
-    sessions long after the K8s Job resource is garbage-collected.
+    K8s Jobs are auto-deleted after TTL, but status.json files persist.
+    This ensures the Portal jobs board keeps showing completed sessions
+    long after the K8s Job resource is garbage-collected.
 
     When *owner* is provided, only sessions belonging to that owner are returned.
     """
     seen_sids: set[str] = set()
     result: list[dict] = []
 
-    _init_k8s()
-    try:
-        jobs = _batch_v1.list_namespaced_job(
-            namespace=NAMESPACE,
-            label_selector="app=rca-worker",
-        )
-    except ApiException:
-        jobs = None
-
-    if jobs:
-        for job in jobs.items:
-            sid = (job.metadata.labels or {}).get("session-id", "")
-            if not sid:
+    if _is_remote():
+        import remote_cluster
+        for claim in remote_cluster.list_active_claims():
+            sid = claim.get("session_id", "")
+            if not sid or sid in seen_sids:
                 continue
             seen_sids.add(sid)
             status_data = get_job_status(sid)
-            created_at = None
-            if job.metadata.creation_timestamp:
-                created_at = job.metadata.creation_timestamp.isoformat()
-            result.append(_session_entry(sid, status_data, created_at))
+            result.append(_session_entry(sid, status_data, None))
+    else:
+        _init_k8s()
+        try:
+            jobs = _batch_v1.list_namespaced_job(
+                namespace=NAMESPACE,
+                label_selector="app=rca-worker",
+            )
+        except ApiException:
+            jobs = None
 
-    jobs_root = Path(SHARED_PVC_MOUNT) / "jobs"
+        if jobs:
+            for job in jobs.items:
+                sid = (job.metadata.labels or {}).get("session-id", "")
+                if not sid:
+                    continue
+                seen_sids.add(sid)
+                status_data = get_job_status(sid)
+                created_at = None
+                if job.metadata.creation_timestamp:
+                    created_at = job.metadata.creation_timestamp.isoformat()
+                result.append(_session_entry(sid, status_data, created_at))
+
+    jobs_root = Path(LOCAL_SESSION_DIR if _is_remote() else SHARED_PVC_MOUNT) / "jobs"
     if jobs_root.is_dir():
         for entry in jobs_root.iterdir():
             if not entry.is_dir():
@@ -316,7 +392,14 @@ def list_all_jobs(owner: str | None = None) -> list[dict]:
 
 
 def list_active_jobs() -> list[dict]:
-    """Return only currently active/running K8s Jobs (for admin stats)."""
+    """Return only currently active/running jobs (for admin stats)."""
+    if _is_remote():
+        import remote_cluster
+        return [
+            {"session_id": c["session_id"], "name": c["namespace"]}
+            for c in remote_cluster.list_active_claims()
+        ]
+
     _init_k8s()
     try:
         jobs = _batch_v1.list_namespaced_job(
@@ -410,13 +493,13 @@ def _k8s_job_phase(session_id: str) -> str:
     return "unknown"
 
 
-def _create_job(
+def _create_local_job(
     session_id: str,
     env_extras: list[client.V1EnvVar],
     must_gather_base_dir: str,
     owner: str = "",
 ) -> str:
-    """Build and create the K8s Job resource."""
+    """Build and create the K8s Job resource (single-cluster mode)."""
     _init_k8s()
 
     if not WORKER_IMAGE:
@@ -544,3 +627,170 @@ def _create_job(
     })
 
     return name
+
+
+# ---------------------------------------------------------------------------
+# Cross-cluster (remote) job helpers
+# ---------------------------------------------------------------------------
+
+def _remote_job_phase(session_id: str) -> str:
+    """Query the remote cluster for the Job phase."""
+    try:
+        import remote_cluster
+        ns = remote_cluster.get_namespace_for_session(session_id)
+        if not ns:
+            return "unknown"
+        name = _job_name(session_id)
+        return remote_cluster.get_job_phase(ns, name)
+    except Exception:
+        return "unknown"
+
+
+def _generate_callback_token(session_id: str, job_dir: Path) -> str:
+    """Generate a per-session callback token and persist it in status.json."""
+    token = _secrets.token_urlsafe(32)
+    status_file = job_dir / "status.json"
+    if status_file.exists():
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    data["_callback_token"] = token
+    job_dir.mkdir(parents=True, exist_ok=True)
+    status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return token
+
+
+def _create_remote_analysis_job(
+    session_id: str,
+    user_query: str,
+    archive_local_path: Path | None,
+    owner: str = "",
+) -> str:
+    """Upload to GCS, claim a namespace from the pool, create Job."""
+    import remote_cluster
+    import object_storage
+
+    job_dir = get_job_dir(session_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    if archive_local_path and archive_local_path.exists():
+        object_storage.upload_archive(session_id, archive_local_path)
+
+    callback_token = _generate_callback_token(session_id, job_dir)
+
+    ns = remote_cluster.claim_namespace(session_id)
+
+    env_extras = [
+        client.V1EnvVar(name="USER_QUERY", value=user_query),
+        client.V1EnvVar(name="MODE", value="analyze"),
+        client.V1EnvVar(name="OWNER", value=owner),
+        client.V1EnvVar(name="COMMS_MODE", value="callback"),
+        client.V1EnvVar(name="API_CALLBACK_URL", value=API_CALLBACK_URL),
+        client.V1EnvVar(name="CALLBACK_TOKEN", value=callback_token),
+    ]
+
+    name = remote_cluster.create_remote_job(
+        namespace=ns,
+        session_id=session_id,
+        env_extras=env_extras,
+    )
+
+    _write_status_file(job_dir, {
+        "session_id": session_id,
+        "status": "running",
+        "phase": "initializing",
+        "progress": 0,
+        "message": "Remote job created, waiting for pod to start...",
+        "owner": owner or "unknown",
+        "_remote_namespace": ns,
+    })
+
+    logger.info("Created remote analysis job %s in namespace %s", name, ns)
+    return name
+
+
+def _create_remote_deepening_job(
+    session_id: str,
+    orch_session_id: str,
+    feedback_text: str,
+    owner: str = "",
+) -> str:
+    """Create a deepening job on the remote cluster.
+
+    Reuses the same namespace claim.  Deletes the previous Job first
+    to avoid name collisions.
+    """
+    import remote_cluster
+
+    job_dir = get_job_dir(session_id)
+
+    ns = remote_cluster.get_namespace_for_session(session_id)
+    if not ns:
+        ns = remote_cluster.claim_namespace(session_id)
+
+    try:
+        old_name = _job_name(session_id)
+        remote_cluster.delete_job(ns, old_name)
+    except Exception:
+        pass
+
+    callback_token = _generate_callback_token(session_id, job_dir)
+
+    env_extras = [
+        client.V1EnvVar(name="MODE", value="deepening"),
+        client.V1EnvVar(name="ORCHESTRATOR_SESSION_ID", value=orch_session_id),
+        client.V1EnvVar(name="FEEDBACK_TEXT", value=feedback_text),
+        client.V1EnvVar(name="OWNER", value=owner),
+        client.V1EnvVar(name="COMMS_MODE", value="callback"),
+        client.V1EnvVar(name="API_CALLBACK_URL", value=API_CALLBACK_URL),
+        client.V1EnvVar(name="CALLBACK_TOKEN", value=callback_token),
+    ]
+
+    name = remote_cluster.create_remote_job(
+        namespace=ns,
+        session_id=session_id,
+        env_extras=env_extras,
+    )
+
+    _write_status_file(job_dir, {
+        "session_id": session_id,
+        "status": "running",
+        "phase": "initializing",
+        "progress": 5,
+        "message": "Remote deepening job created...",
+        "owner": owner or "unknown",
+        "_remote_namespace": ns,
+    })
+
+    logger.info("Created remote deepening job %s in namespace %s", name, ns)
+    return name
+
+
+def get_callback_token(session_id: str) -> str:
+    """Retrieve the stored callback token for a session."""
+    status_file = get_job_dir(session_id) / "status.json"
+    if status_file.exists():
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+            return data.get("_callback_token", "")
+        except Exception:
+            pass
+    return ""
+
+
+def trigger_remote_cleanup(session_id: str) -> None:
+    """Release the namespace back to the pool and clean up GCS objects."""
+    if not _is_remote():
+        return
+
+    import remote_cluster
+    import object_storage
+
+    remote_cluster.release_namespace(session_id)
+    try:
+        object_storage.delete_session_objects(session_id)
+    except Exception:
+        logger.warning("Failed to delete GCS objects for session %s", session_id)

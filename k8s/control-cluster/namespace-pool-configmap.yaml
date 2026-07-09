@@ -1,0 +1,18 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: namespace-pool
+  namespace: must-gather
+  labels:
+    app: must-gather-api
+    purpose: namespace-pool
+data:
+  namespaces.json: |
+    [
+      "rca-pool-01",
+      "rca-pool-02",
+      "rca-pool-03",
+      "rca-pool-04",
+      "rca-pool-05"
+    ]

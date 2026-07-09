@@ -59,7 +59,13 @@ MUST_GATHER_EXTRACT_DIR = Path(os.environ.get("MUST_GATHER_EXTRACT_DIR", "/data/
 
 SHARED_PVC_MOUNT = Path(os.environ.get("SHARED_PVC_MOUNT", "/shared"))
 
-UPLOAD_DIR = SHARED_PVC_MOUNT / "_uploads"
+JOBS_CLUSTER_MODE: str = os.environ.get("JOBS_CLUSTER_MODE", "disabled")
+LOCAL_SESSION_DIR: str = os.environ.get("LOCAL_SESSION_DIR", "/data/sessions")
+
+if JOBS_CLUSTER_MODE == "enabled":
+    UPLOAD_DIR = Path(LOCAL_SESSION_DIR) / "_uploads"
+else:
+    UPLOAD_DIR = SHARED_PVC_MOUNT / "_uploads"
 
 ADMIN_USERS: set[str] = {
     u.strip().lower()
@@ -337,7 +343,10 @@ def _hydra_download_specific(case_number: str, attachment_uuid: str, filename: s
 
 
 # ── Background download tracking (file-based, shared across worker processes) ─
-_DOWNLOAD_STATUS_DIR = SHARED_PVC_MOUNT / "_download_status"
+if JOBS_CLUSTER_MODE == "enabled":
+    _DOWNLOAD_STATUS_DIR = Path(LOCAL_SESSION_DIR) / "_download_status"
+else:
+    _DOWNLOAD_STATUS_DIR = SHARED_PVC_MOUNT / "_download_status"
 _DOWNLOAD_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -945,12 +954,15 @@ def analyze(request: AnalyzeRequest, req: Request = None):
         "owner": owner,
     }, indent=2), encoding="utf-8")
 
+    archive_path = Path(must_gather_base_dir) if Path(must_gather_base_dir).is_file() else None
+
     try:
         job_runner.create_analysis_job(
             session_id=session_id,
             user_query=user_query,
             must_gather_base_dir=must_gather_base_dir,
             owner=owner,
+            archive_local_path=archive_path,
         )
     except Exception as e:
         logger.exception("Failed to create K8s Job for session %s", session_id)
@@ -2013,6 +2025,228 @@ def clear_memory():
         return {"status": "ok", "message": "Session data cleared."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear session: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Worker callback endpoints (cross-cluster mode)
+# ---------------------------------------------------------------------------
+
+def _verify_callback_token(request: Request, session_id: str) -> None:
+    """Validate the per-session bearer token from a worker callback."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = auth[7:]
+    expected = job_runner.get_callback_token(session_id)
+    if not expected or not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="Invalid callback token")
+
+
+@app.get("/callback/input/{session_id}")
+async def callback_get_input(session_id: str, request: Request):
+    """Stream the must-gather archive from GCS to the worker.
+
+    The API proxies the archive — workers never talk to GCS directly.
+    """
+    _verify_callback_token(request, session_id)
+
+    try:
+        import object_storage
+        meta = object_storage.get_archive_metadata(session_id)
+        stream = object_storage.stream_download(session_id)
+        return StreamingResponse(
+            stream,
+            media_type=meta["content_type"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{meta["name"]}"',
+                "Content-Length": str(meta["size"]),
+            },
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"No archive found for session {session_id}")
+    except Exception as e:
+        logger.exception("Failed to stream input for session %s", session_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/callback/status")
+async def callback_post_status(request: Request):
+    """Receive a status update from a worker."""
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+
+    _verify_callback_token(request, session_id)
+
+    job_dir = job_runner.get_job_dir(session_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    status_file = job_dir / "status.json"
+    existing = {}
+    if status_file.exists():
+        try:
+            existing = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    for key in ("owner", "problem_statement", "case_number", "deepening_round", "_callback_token"):
+        if key not in body and key in existing:
+            body[key] = existing[key]
+
+    body["updated_at"] = datetime.now().isoformat()
+
+    tmp = job_dir / "status.json.tmp"
+    tmp.write_text(json.dumps(body, indent=2), encoding="utf-8")
+    tmp.rename(status_file)
+
+    if body.get("status") in ("completed", "error"):
+        import asyncio
+        asyncio.get_event_loop().call_later(
+            30, lambda: _schedule_remote_cleanup(session_id)
+        )
+
+    return {"status": "ok"}
+
+
+@app.post("/callback/results/{session_id}")
+async def callback_post_results(session_id: str, request: Request):
+    """Receive results tarball from a worker."""
+    _verify_callback_token(request, session_id)
+
+    job_dir = job_runner.get_job_dir(session_id)
+    results_dir = job_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    body = await request.body()
+
+    import io as _io
+    import tarfile as _tarfile
+    buf = _io.BytesIO(body)
+    try:
+        with _tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            tar.extractall(path=str(results_dir))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to extract results tar: {e}")
+
+    return {"status": "ok", "files_received": len(list(results_dir.iterdir()))}
+
+
+@app.post("/callback/agent-memory/{session_id}")
+async def callback_post_agent_memory(session_id: str, request: Request):
+    """Receive agent_memory.json from a worker."""
+    _verify_callback_token(request, session_id)
+
+    job_dir = job_runner.get_job_dir(session_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    body = await request.body()
+    dest = job_dir / "agent_memory.json"
+    dest.write_bytes(body)
+
+    return {"status": "ok"}
+
+
+@app.get("/callback/agent-memory/{session_id}")
+async def callback_get_agent_memory(session_id: str, request: Request):
+    """Serve agent_memory.json to a worker (for deepening rounds)."""
+    _verify_callback_token(request, session_id)
+
+    job_dir = job_runner.get_job_dir(session_id)
+    mem_file = job_dir / "agent_memory.json"
+    if not mem_file.exists():
+        raise HTTPException(status_code=404, detail="No agent memory found")
+
+    return JSONResponse(content=json.loads(mem_file.read_text(encoding="utf-8")))
+
+
+@app.post("/callback/console/{session_id}")
+async def callback_post_console(session_id: str, request: Request):
+    """Append console log text from a worker."""
+    _verify_callback_token(request, session_id)
+
+    job_dir = job_runner.get_job_dir(session_id)
+    console_path = job_dir / "results" / "workflow_console.txt"
+    console_path.parent.mkdir(parents=True, exist_ok=True)
+
+    body = await request.body()
+    with open(console_path, "ab") as f:
+        f.write(body)
+
+    return {"status": "ok"}
+
+
+def _schedule_remote_cleanup(session_id: str) -> None:
+    """Trigger cleanup of remote namespace and GCS objects."""
+    try:
+        job_runner.trigger_remote_cleanup(session_id)
+    except Exception:
+        logger.exception("Failed to clean up remote resources for session %s", session_id)
+
+
+# ---------------------------------------------------------------------------
+# Startup events (cross-cluster mode)
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _startup_cross_cluster():
+    """Initialize cross-cluster features if enabled."""
+    if JOBS_CLUSTER_MODE != "enabled":
+        return
+
+    Path(LOCAL_SESSION_DIR).mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _reconcile_running_sessions()
+    except Exception:
+        logger.exception("Startup reconciliation failed")
+
+
+def _reconcile_running_sessions() -> None:
+    """On startup, check for sessions that were running when the API restarted."""
+    if JOBS_CLUSTER_MODE != "enabled":
+        return
+
+    import remote_cluster
+
+    jobs_root = Path(LOCAL_SESSION_DIR) / "jobs"
+    if not jobs_root.is_dir():
+        return
+
+    for sid_dir in jobs_root.iterdir():
+        if not sid_dir.is_dir():
+            continue
+        status_file = sid_dir / "status.json"
+        if not status_file.exists():
+            continue
+        try:
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("status") != "running":
+            continue
+
+        sid = sid_dir.name
+        ns = remote_cluster.get_namespace_for_session(sid)
+        if not ns:
+            data["status"] = "error"
+            data["message"] = "No namespace claim found after API restart"
+            data["updated_at"] = datetime.now().isoformat()
+            status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            logger.info("Reconciliation: marked session %s as error (no namespace claim)", sid)
+            continue
+        name = f"rca-{sid.lower().replace('_', '-')}"[:63]
+        try:
+            phase = remote_cluster.get_job_phase(ns, name)
+            if phase == "failed":
+                data["status"] = "error"
+                data["message"] = "Worker failed during API restart"
+                data["updated_at"] = datetime.now().isoformat()
+                status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                logger.info("Reconciliation: marked session %s as error (job failed)", sid)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
