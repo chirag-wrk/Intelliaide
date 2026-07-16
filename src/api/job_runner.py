@@ -9,8 +9,8 @@ Supports two modes controlled by ``JOBS_CLUSTER_MODE``:
 - ``disabled`` (default) — single-cluster mode.  All data exchange happens
   through a shared PVC mounted at ``SHARED_PVC_MOUNT``.
 - ``enabled`` — cross-cluster mode.  Jobs run in ephemeral namespaces on a
-  remote cluster.  Data flows through the API (GCS-backed for large archives,
-  HTTP callbacks for status/results).
+  remote cluster.  Job metadata is stored as K8s annotations; results and
+  session state are persisted to GCS.
 """
 
 import json
@@ -18,6 +18,7 @@ import logging
 import os
 import secrets as _secrets
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -45,7 +46,6 @@ WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "512Mi")
 WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
 
 JOBS_CLUSTER_MODE: str = os.environ.get("JOBS_CLUSTER_MODE", "disabled")
-LOCAL_SESSION_DIR: str = os.environ.get("LOCAL_SESSION_DIR", "/data/sessions")
 API_CALLBACK_URL: str = os.environ.get("API_CALLBACK_URL", "")
 
 # ---------------------------------------------------------------------------
@@ -86,19 +86,18 @@ def _job_dir_on_pvc(session_id: str) -> str:
     return f"{SHARED_PVC_MOUNT}/jobs/{session_id}"
 
 
-def _job_dir_local(session_id: str) -> str:
-    """Return the local session directory for cross-cluster mode."""
-    return f"{LOCAL_SESSION_DIR}/jobs/{session_id}"
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_job_dir(session_id: str) -> Path:
-    """Return the job directory — local storage in remote mode, PVC in local mode."""
+def get_job_dir(session_id: str) -> Path | None:
+    """Return the job directory on the shared PVC (single-cluster mode).
+
+    Returns ``None`` in remote mode — callers must use K8s annotations
+    and GCS instead.
+    """
     if _is_remote():
-        return Path(_job_dir_local(session_id))
+        return None
     return Path(_job_dir_on_pvc(session_id))
 
 
@@ -146,11 +145,19 @@ def create_deepening_job(
     """Create a K8s Job for a feedback / deepening round.
 
     Deletes any existing Job for this session first (the completed analysis
-    Job) to avoid name collisions.  Increments ``deepening_round`` in
-    status.json so the admin portal can display which round is running.
+    Job) to avoid name collisions.  Increments ``deepening_round`` so the
+    admin portal can display which round is running.
 
     Returns the Job name.
     """
+    if _is_remote():
+        return _create_remote_deepening_job(
+            session_id=session_id,
+            orch_session_id=orch_session_id,
+            feedback_text=feedback_text,
+            owner=owner,
+        )
+
     job_dir = get_job_dir(session_id)
     prev_round = 1
     status_file = job_dir / "status.json"
@@ -161,14 +168,6 @@ def create_deepening_job(
         except Exception:
             pass
     _write_status_file(job_dir, {"deepening_round": prev_round + 1})
-
-    if _is_remote():
-        return _create_remote_deepening_job(
-            session_id=session_id,
-            orch_session_id=orch_session_id,
-            feedback_text=feedback_text,
-            owner=owner,
-        )
 
     _delete_existing_job(session_id)
 
@@ -186,12 +185,16 @@ def create_deepening_job(
 
 
 def get_job_status(session_id: str) -> dict:
-    """Read status.json for this session.
+    """Read job status for this session.
 
-    In remote mode, status.json is populated by callback handlers.
-    Falls back to the K8s Job phase when status.json is missing or stale.
+    In remote mode, reads the ``rca.intelliaide/status`` annotation from the
+    K8s Job.  Falls back to GCS ``status.json`` for TTL-deleted Jobs.
+    In single-cluster mode, reads ``status.json`` from the PVC.
     """
-    status_file = get_job_dir(session_id) / "status.json"
+    if _is_remote():
+        return _get_remote_job_status(session_id)
+
+    status_file = Path(_job_dir_on_pvc(session_id)) / "status.json"
     status: dict = {}
     if status_file.exists():
         try:
@@ -203,11 +206,7 @@ def get_job_status(session_id: str) -> dict:
     if status.get("status") in ("completed", "error"):
         return status
 
-    if _is_remote():
-        k8s_phase = _remote_job_phase(session_id)
-    else:
-        k8s_phase = _k8s_job_phase(session_id)
-
+    k8s_phase = _k8s_job_phase(session_id)
     if k8s_phase == "failed" and status.get("status") != "error":
         status.update({"status": "error", "message": "Worker pod failed unexpectedly"})
     elif not status:
@@ -221,35 +220,81 @@ def get_job_status(session_id: str) -> dict:
     return status
 
 
+def _get_remote_job_status(session_id: str) -> dict:
+    """Read status from K8s Job annotation, falling back to GCS."""
+    import remote_cluster
+    import object_storage
+
+    ns = remote_cluster.get_namespace_for_session(session_id)
+    if ns:
+        name = _job_name(session_id)
+        ann = remote_cluster.get_job_annotations(ns, name)
+        status_json = ann.get(remote_cluster._ann("status"), "")
+        if status_json:
+            try:
+                status = json.loads(status_json)
+                if status.get("status") in ("completed", "error"):
+                    return status
+                k8s_phase = remote_cluster.get_job_phase(ns, name)
+                if k8s_phase == "failed" and status.get("status") != "error":
+                    status.update({"status": "error", "message": "Worker pod failed unexpectedly"})
+                return status
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    gcs_status = object_storage.read_json(session_id, "status.json")
+    if gcs_status:
+        return gcs_status
+
+    return {
+        "session_id": session_id,
+        "status": "unknown",
+        "phase": "unknown",
+        "progress": 0,
+        "message": "No status available",
+    }
+
+
 def cancel_job(session_id: str) -> dict:
     """Delete the K8s Job (cascading) to terminate the worker pod."""
-    job_dir = get_job_dir(session_id)
-
     if _is_remote():
         import remote_cluster
         import object_storage
 
+        cancelled_status = {
+            "session_id": session_id,
+            "status": "cancelled",
+            "message": "Analysis cancelled by user",
+            "updated_at": datetime.now().isoformat(),
+        }
+
         ns = remote_cluster.get_namespace_for_session(session_id)
         if ns:
             name = _job_name(session_id)
+            try:
+                remote_cluster.patch_job_annotations(ns, name, {
+                    remote_cluster._ann("status"): json.dumps(cancelled_status),
+                })
+            except Exception:
+                pass
             try:
                 remote_cluster.delete_job(ns, name)
             except Exception:
                 pass
             remote_cluster.release_namespace(session_id)
         try:
-            object_storage.delete_session_objects(session_id)
+            object_storage.write_json(session_id, "status.json", cancelled_status)
+        except Exception:
+            pass
+        try:
+            object_storage.delete_prefix(session_id, "archive")
         except Exception:
             pass
 
-        _write_status_file(job_dir, {
-            "session_id": session_id,
-            "status": "cancelled",
-            "message": "Analysis cancelled by user",
-        })
         return {"status": "cancelled", "session_id": session_id}
 
     _init_k8s()
+    job_dir = Path(_job_dir_on_pvc(session_id))
     name = _job_name(session_id)
     try:
         _batch_v1.delete_namespaced_job(
@@ -286,11 +331,11 @@ def cleanup_job(session_id: str) -> None:
             object_storage.delete_session_objects(session_id)
         except Exception:
             pass
-    else:
-        _init_k8s()
-        _delete_k8s_job_resource(session_id)
+        return
 
-    job_dir = get_job_dir(session_id)
+    _init_k8s()
+    _delete_k8s_job_resource(session_id)
+    job_dir = Path(_job_dir_on_pvc(session_id))
     if job_dir.exists():
         shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -298,10 +343,12 @@ def cleanup_job(session_id: str) -> None:
 def cleanup_job_input(session_id: str) -> None:
     """Delete only the bulky extracted must-gather input/ dir on the PVC.
 
-    Keeps results/, status.json, agent_memory.json so the session still
-    appears in the Portal jobs board after completion.
+    In remote mode this is a no-op (the archive is in GCS, worker uses
+    emptyDir scratch).
     """
-    input_dir = get_job_dir(session_id) / "input"
+    if _is_remote():
+        return
+    input_dir = Path(_job_dir_on_pvc(session_id)) / "input"
     if input_dir.exists():
         shutil.rmtree(input_dir, ignore_errors=True)
         logger.info("Cleaned up input/ for session %s (reclaimed PVC space)", session_id)
@@ -323,11 +370,11 @@ def _delete_k8s_job_resource(session_id: str) -> None:
 
 
 def list_all_jobs(owner: str | None = None) -> list[dict]:
-    """Return every session — from live K8s Jobs AND from status files.
+    """Return every session — from live K8s Jobs AND from historical records.
 
-    K8s Jobs are auto-deleted after TTL, but status.json files persist.
-    This ensures the Portal jobs board keeps showing completed sessions
-    long after the K8s Job resource is garbage-collected.
+    In remote mode, queries live K8s Jobs across the namespace pool and
+    falls back to GCS ``status.json`` objects for TTL-deleted sessions.
+    In single-cluster mode, queries local K8s and PVC filesystem.
 
     When *owner* is provided, only sessions belonging to that owner are returned.
     """
@@ -336,13 +383,38 @@ def list_all_jobs(owner: str | None = None) -> list[dict]:
 
     if _is_remote():
         import remote_cluster
-        for claim in remote_cluster.list_active_claims():
-            sid = claim.get("session_id", "")
+        import object_storage
+
+        for job in remote_cluster.list_jobs_in_pool("app=rca-worker"):
+            sid = (job.metadata.labels or {}).get("session-id", "")
             if not sid or sid in seen_sids:
                 continue
             seen_sids.add(sid)
-            status_data = get_job_status(sid)
-            result.append(_session_entry(sid, status_data, None))
+            status_json = (job.metadata.annotations or {}).get(
+                remote_cluster._ann("status"), ""
+            )
+            status_data = {}
+            if status_json:
+                try:
+                    status_data = json.loads(status_json)
+                except Exception:
+                    pass
+            if not status_data:
+                status_data = get_job_status(sid)
+            created_at = None
+            if job.metadata.creation_timestamp:
+                created_at = job.metadata.creation_timestamp.isoformat()
+            result.append(_session_entry(sid, status_data, created_at))
+
+        for prefix in object_storage.list_session_prefixes():
+            if prefix in seen_sids:
+                continue
+            gcs_status = object_storage.read_json(prefix, "status.json")
+            if not gcs_status:
+                continue
+            seen_sids.add(prefix)
+            created_at = gcs_status.get("updated_at")
+            result.append(_session_entry(prefix, gcs_status, created_at))
     else:
         _init_k8s()
         try:
@@ -365,24 +437,24 @@ def list_all_jobs(owner: str | None = None) -> list[dict]:
                     created_at = job.metadata.creation_timestamp.isoformat()
                 result.append(_session_entry(sid, status_data, created_at))
 
-    jobs_root = Path(LOCAL_SESSION_DIR if _is_remote() else SHARED_PVC_MOUNT) / "jobs"
-    if jobs_root.is_dir():
-        for entry in jobs_root.iterdir():
-            if not entry.is_dir():
-                continue
-            sid = entry.name
-            if sid in seen_sids:
-                continue
-            status_file = entry / "status.json"
-            if not status_file.exists():
-                continue
-            try:
-                status_data = json.loads(status_file.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            created_at = status_data.get("updated_at")
-            seen_sids.add(sid)
-            result.append(_session_entry(sid, status_data, created_at))
+        jobs_root = Path(SHARED_PVC_MOUNT) / "jobs"
+        if jobs_root.is_dir():
+            for entry in jobs_root.iterdir():
+                if not entry.is_dir():
+                    continue
+                sid = entry.name
+                if sid in seen_sids:
+                    continue
+                status_file = entry / "status.json"
+                if not status_file.exists():
+                    continue
+                try:
+                    status_data = json.loads(status_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                created_at = status_data.get("updated_at")
+                seen_sids.add(sid)
+                result.append(_session_entry(sid, status_data, created_at))
 
     if owner:
         result = [e for e in result if e.get("owner", "").lower() == owner.lower()]
@@ -441,8 +513,7 @@ def _session_entry(sid: str, status_data: dict, created_at: str | None) -> dict:
 # ---------------------------------------------------------------------------
 
 def _write_status_file(job_dir: Path, status: dict) -> None:
-    """Write status.json atomically, preserving sticky fields from previous state."""
-    from datetime import datetime
+    """Write status.json atomically, preserving sticky fields (single-cluster mode)."""
     _STICKY_KEYS = ("owner", "problem_statement", "case_number", "deepening_round")
     job_dir.mkdir(parents=True, exist_ok=True)
     final = job_dir / "status.json"
@@ -458,6 +529,30 @@ def _write_status_file(job_dir: Path, status: dict) -> None:
     tmp = job_dir / "status.json.tmp"
     tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
     tmp.rename(final)
+
+
+def _write_remote_status(session_id: str, status: dict) -> None:
+    """Patch the status annotation on the K8s Job (cross-cluster mode).
+
+    Also writes to GCS on terminal status for historical persistence.
+    """
+    import remote_cluster
+    import object_storage
+
+    status["updated_at"] = datetime.now().isoformat()
+
+    ns = remote_cluster.get_namespace_for_session(session_id)
+    if ns:
+        name = _job_name(session_id)
+        remote_cluster.patch_job_annotations(ns, name, {
+            remote_cluster._ann("status"): json.dumps(status),
+        })
+
+    if status.get("status") in ("completed", "error", "cancelled"):
+        try:
+            object_storage.write_json(session_id, "status.json", status)
+        except Exception:
+            logger.warning("Failed to persist terminal status to GCS for %s", session_id)
 
 
 def _delete_existing_job(session_id: str) -> None:
@@ -616,7 +711,7 @@ def _create_local_job(
     _batch_v1.create_namespaced_job(namespace=NAMESPACE, body=job)
     logger.info("Created K8s Job %s for session %s (owner=%s)", name, session_id, owner)
 
-    job_dir = get_job_dir(session_id)
+    job_dir = Path(_job_dir_on_pvc(session_id))
     _write_status_file(job_dir, {
         "session_id": session_id,
         "status": "running",
@@ -646,42 +741,30 @@ def _remote_job_phase(session_id: str) -> str:
         return "unknown"
 
 
-def _generate_callback_token(session_id: str, job_dir: Path) -> str:
-    """Generate a per-session callback token and persist it in status.json."""
-    token = _secrets.token_urlsafe(32)
-    status_file = job_dir / "status.json"
-    if status_file.exists():
-        try:
-            data = json.loads(status_file.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    else:
-        data = {}
-    data["_callback_token"] = token
-    job_dir.mkdir(parents=True, exist_ok=True)
-    status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return token
-
-
 def _create_remote_analysis_job(
     session_id: str,
     user_query: str,
     archive_local_path: Path | None,
     owner: str = "",
 ) -> str:
-    """Upload to GCS, claim a namespace from the pool, create Job."""
+    """Upload archive to GCS, claim a namespace, create Job with annotations."""
     import remote_cluster
     import object_storage
-
-    job_dir = get_job_dir(session_id)
-    job_dir.mkdir(parents=True, exist_ok=True)
 
     if archive_local_path and archive_local_path.exists():
         object_storage.upload_archive(session_id, archive_local_path)
 
-    callback_token = _generate_callback_token(session_id, job_dir)
-
+    callback_token = _secrets.token_urlsafe(32)
     ns = remote_cluster.claim_namespace(session_id)
+
+    initial_status = {
+        "session_id": session_id,
+        "status": "running",
+        "phase": "initializing",
+        "progress": 0,
+        "message": "Remote job created, waiting for pod to start...",
+        "owner": owner or "unknown",
+    }
 
     env_extras = [
         client.V1EnvVar(name="USER_QUERY", value=user_query),
@@ -696,17 +779,9 @@ def _create_remote_analysis_job(
         namespace=ns,
         session_id=session_id,
         env_extras=env_extras,
+        callback_token=callback_token,
+        initial_status=initial_status,
     )
-
-    _write_status_file(job_dir, {
-        "session_id": session_id,
-        "status": "running",
-        "phase": "initializing",
-        "progress": 0,
-        "message": "Remote job created, waiting for pod to start...",
-        "owner": owner or "unknown",
-        "_remote_namespace": ns,
-    })
 
     logger.info("Created remote analysis job %s in namespace %s", name, ns)
     return name
@@ -721,23 +796,40 @@ def _create_remote_deepening_job(
     """Create a deepening job on the remote cluster.
 
     Reuses the same namespace claim.  Deletes the previous Job first
-    to avoid name collisions.
+    to avoid name collisions.  Reads and increments deepening_round
+    from the existing Job annotation.
     """
     import remote_cluster
 
-    job_dir = get_job_dir(session_id)
-
     ns = remote_cluster.get_namespace_for_session(session_id)
-    if not ns:
+
+    prev_round = 1
+    if ns:
+        old_name = _job_name(session_id)
+        ann = remote_cluster.get_job_annotations(ns, old_name)
+        try:
+            prev_round = int(ann.get(remote_cluster._ann("deepening-round"), "1"))
+        except (ValueError, TypeError):
+            pass
+        try:
+            remote_cluster.delete_job(ns, old_name)
+        except Exception:
+            pass
+    else:
         ns = remote_cluster.claim_namespace(session_id)
 
-    try:
-        old_name = _job_name(session_id)
-        remote_cluster.delete_job(ns, old_name)
-    except Exception:
-        pass
+    new_round = prev_round + 1
+    callback_token = _secrets.token_urlsafe(32)
 
-    callback_token = _generate_callback_token(session_id, job_dir)
+    initial_status = {
+        "session_id": session_id,
+        "status": "running",
+        "phase": "initializing",
+        "progress": 5,
+        "message": "Remote deepening job created...",
+        "owner": owner or "unknown",
+        "deepening_round": new_round,
+    }
 
     env_extras = [
         client.V1EnvVar(name="MODE", value="deepening"),
@@ -753,25 +845,29 @@ def _create_remote_deepening_job(
         namespace=ns,
         session_id=session_id,
         env_extras=env_extras,
+        callback_token=callback_token,
+        initial_status=initial_status,
     )
-
-    _write_status_file(job_dir, {
-        "session_id": session_id,
-        "status": "running",
-        "phase": "initializing",
-        "progress": 5,
-        "message": "Remote deepening job created...",
-        "owner": owner or "unknown",
-        "_remote_namespace": ns,
-    })
 
     logger.info("Created remote deepening job %s in namespace %s", name, ns)
     return name
 
 
 def get_callback_token(session_id: str) -> str:
-    """Retrieve the stored callback token for a session."""
-    status_file = get_job_dir(session_id) / "status.json"
+    """Retrieve the callback token for a session.
+
+    In remote mode, reads from K8s Job annotation.
+    In single-cluster mode, reads from status.json on the PVC.
+    """
+    if _is_remote():
+        import remote_cluster
+        ns = remote_cluster.get_namespace_for_session(session_id)
+        if not ns:
+            return ""
+        ann = remote_cluster.get_job_annotations(ns, _job_name(session_id))
+        return ann.get(remote_cluster._ann("callback-token"), "")
+
+    status_file = Path(_job_dir_on_pvc(session_id)) / "status.json"
     if status_file.exists():
         try:
             data = json.loads(status_file.read_text(encoding="utf-8"))
@@ -782,15 +878,28 @@ def get_callback_token(session_id: str) -> str:
 
 
 def trigger_remote_cleanup(session_id: str) -> None:
-    """Release the namespace back to the pool and clean up GCS objects."""
+    """Release the namespace back to the pool and clean up the input archive.
+
+    Preserves results and status.json in GCS for historical queries.
+    """
     if not _is_remote():
         return
 
     import remote_cluster
     import object_storage
 
-    remote_cluster.release_namespace(session_id)
+    status = get_job_status(session_id)
+    if status.get("status") not in ("completed", "error", "cancelled"):
+        status["status"] = "completed"
+        status["updated_at"] = datetime.now().isoformat()
     try:
-        object_storage.delete_session_objects(session_id)
+        object_storage.write_json(session_id, "status.json", status)
     except Exception:
-        logger.warning("Failed to delete GCS objects for session %s", session_id)
+        logger.warning("Failed to persist final status to GCS for %s", session_id)
+
+    remote_cluster.release_namespace(session_id)
+
+    try:
+        object_storage.delete_prefix(session_id, "archive")
+    except Exception:
+        logger.warning("Failed to delete archive from GCS for session %s", session_id)

@@ -1,15 +1,18 @@
 """
-GCS object storage for must-gather archives.
+GCS object storage for must-gather archives, results, and session state.
 
-Used **only by the API pod** to durably store large input archives and
-stream them to workers on a remote cluster via proxy endpoints.
-Workers never interact with GCS directly.
+Used **only by the API pod** to durably store input archives, analysis
+results, agent memory, and session metadata.  Workers never interact
+with GCS directly — all data flows through the API's callback endpoints.
 """
 
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Iterator, Optional
+
+from google.cloud.exceptions import NotFound
 
 from google.cloud import storage
 
@@ -121,3 +124,78 @@ def delete_session_objects(session_id: str) -> int:
     if count:
         logger.info("Deleted %d GCS objects for session %s", count, session_id)
     return count
+
+
+def delete_prefix(session_id: str, key_prefix: str) -> int:
+    """Delete blobs under ``{session_id}/{key_prefix}``. Returns count deleted."""
+    prefix = f"{session_id}/{key_prefix}"
+    blobs = list(_bucket().list_blobs(prefix=prefix))
+    count = 0
+    for blob in blobs:
+        blob.delete()
+        count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Generic key-value helpers (JSON / bytes / text)
+# ---------------------------------------------------------------------------
+
+def write_json(session_id: str, key: str, data: dict) -> None:
+    """Write a JSON-serialisable dict to ``{session_id}/{key}``."""
+    blob = _bucket().blob(f"{session_id}/{key}")
+    blob.upload_from_string(
+        json.dumps(data, indent=2),
+        content_type="application/json",
+    )
+
+
+def read_json(session_id: str, key: str) -> dict | None:
+    """Read a JSON object from ``{session_id}/{key}``. Returns None if missing."""
+    blob = _bucket().blob(f"{session_id}/{key}")
+    try:
+        return json.loads(blob.download_as_text(encoding="utf-8"))
+    except NotFound:
+        return None
+
+
+def write_bytes(session_id: str, key: str, data: bytes,
+                content_type: str = "application/octet-stream") -> None:
+    """Write raw bytes to ``{session_id}/{key}``."""
+    blob = _bucket().blob(f"{session_id}/{key}")
+    blob.upload_from_string(data, content_type=content_type)
+
+
+def read_bytes(session_id: str, key: str) -> bytes | None:
+    """Read raw bytes from ``{session_id}/{key}``. Returns None if missing."""
+    blob = _bucket().blob(f"{session_id}/{key}")
+    try:
+        return blob.download_as_bytes()
+    except NotFound:
+        return None
+
+
+def write_text(session_id: str, key: str, text: str) -> None:
+    """Write UTF-8 text to ``{session_id}/{key}``."""
+    blob = _bucket().blob(f"{session_id}/{key}")
+    blob.upload_from_string(text.encode("utf-8"), content_type="text/plain; charset=utf-8")
+
+
+def read_text(session_id: str, key: str) -> str | None:
+    """Read UTF-8 text from ``{session_id}/{key}``. Returns None if missing."""
+    blob = _bucket().blob(f"{session_id}/{key}")
+    try:
+        return blob.download_as_text(encoding="utf-8")
+    except NotFound:
+        return None
+
+
+def list_session_prefixes(limit: int = 1000) -> list[str]:
+    """Return up to *limit* session-id prefixes in the bucket."""
+    iterator = _get_client().list_blobs(
+        GCS_BUCKET_NAME, prefix="", delimiter="/", max_results=limit,
+    )
+    # Consume the iterator so .prefixes is populated.
+    for _ in iterator:
+        pass
+    return [p.rstrip("/") for p in iterator.prefixes]

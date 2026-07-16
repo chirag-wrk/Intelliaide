@@ -5,11 +5,13 @@ Namespaces on the jobs cluster are **pre-provisioned in a pool** and made
 available via a ConfigMap mounted on the API pod.  This module claims a
 namespace from the pool, creates Jobs in it, and monitors them.  Namespace
 recycling after job completion is handled by an external operator — the API
-does not create or delete namespaces, nor provision secrets.
+does not create or delete namespaces.  Secrets (GCP ADC, app-config) are
+copied from the API's control-cluster namespace into the target namespace
+at Job creation time.
 
 The pool ConfigMap (mounted as a file) contains a JSON list of namespace
-names.  The API tracks which ones are in use in-memory and persists the
-mapping to local storage so it survives restarts.
+names.  The API tracks which ones are in use in-memory; the mapping is
+rebuilt from live K8s state on startup (no local file persistence).
 
 Uses a dedicated kubeconfig (mounted as a Secret on the API pod) so
 that in-cluster auth for the control cluster is not disturbed.
@@ -29,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 JOBS_CLUSTER_KUBECONFIG: str = os.environ.get("JOBS_CLUSTER_KUBECONFIG", "")
 
+K8S_NAMESPACE: str = os.environ.get("K8S_NAMESPACE", "intellaide-system")
+GCP_SECRET_NAME: str = os.environ.get("GCP_SECRET_NAME", "gcp-credentials")
+APP_CONFIG_SECRET_NAME: str = os.environ.get("APP_CONFIG_SECRET_NAME", "intellaide-system-app-config")
+
 NAMESPACE_POOL_FILE: str = os.environ.get(
     "NAMESPACE_POOL_FILE", "/config/namespace-pool/namespaces.json"
 )
@@ -42,17 +48,19 @@ WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
 JOB_ACTIVE_DEADLINE: int = int(os.environ.get("JOB_ACTIVE_DEADLINE_SECONDS", "3600"))
 JOB_TTL_AFTER_FINISHED: int = int(os.environ.get("JOB_TTL_AFTER_FINISHED", "600"))
 
-LOCAL_SESSION_DIR: str = os.environ.get("LOCAL_SESSION_DIR", "/data/sessions")
+ANNOTATION_PREFIX = "rca.intelliaide"
 
 _api_client: Optional[client.ApiClient] = None
 _batch_v1: Optional[client.BatchV1Api] = None
+_jobs_core_v1: Optional[client.CoreV1Api] = None
+_control_core_v1: Optional[client.CoreV1Api] = None
 
 _pool_lock = threading.Lock()
 _claimed: dict[str, str] = {}  # session_id -> namespace
 
 
 def _init() -> None:
-    global _api_client, _batch_v1
+    global _api_client, _batch_v1, _jobs_core_v1, _control_core_v1
     if _batch_v1 is not None:
         return
 
@@ -64,31 +72,15 @@ def _init() -> None:
 
     _api_client = config.new_client_from_config(config_file=JOBS_CLUSTER_KUBECONFIG)
     _batch_v1 = client.BatchV1Api(api_client=_api_client)
+    _jobs_core_v1 = client.CoreV1Api(api_client=_api_client)
 
-    _load_claims()
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        config.load_kube_config()
+    _control_core_v1 = client.CoreV1Api()
 
-
-def _claims_file() -> Path:
-    return Path(LOCAL_SESSION_DIR) / "_namespace_claims.json"
-
-
-def _save_claims() -> None:
-    """Persist the session→namespace mapping to disk."""
-    p = _claims_file()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(_claimed, indent=2), encoding="utf-8")
-
-
-def _load_claims() -> None:
-    """Restore the session→namespace mapping from disk on startup."""
-    global _claimed
-    p = _claims_file()
-    if p.exists():
-        try:
-            _claimed = json.loads(p.read_text(encoding="utf-8"))
-            logger.info("Restored %d namespace claims from disk", len(_claimed))
-        except Exception:
-            _claimed = {}
+    _rebuild_claims_from_k8s()
 
 
 def _load_pool() -> list[str]:
@@ -111,6 +103,39 @@ def _load_pool() -> list[str]:
     return data
 
 
+def _rebuild_claims_from_k8s() -> None:
+    """Rebuild the in-memory namespace claims from live K8s Jobs."""
+    global _claimed
+    rebuilt: dict[str, str] = {}
+    try:
+        pool = _load_pool()
+    except RuntimeError:
+        logger.warning("Cannot rebuild claims — namespace pool not available yet")
+        return
+
+    for ns in pool:
+        try:
+            jobs = _batch_v1.list_namespaced_job(
+                namespace=ns, label_selector="app=rca-worker",
+            )
+        except ApiException:
+            continue
+        for job in jobs.items:
+            sid = (job.metadata.labels or {}).get("session-id", "")
+            if not sid:
+                continue
+            is_done = (
+                (job.status.succeeded and job.status.succeeded > 0)
+                or (job.status.failed and job.status.failed > 0)
+            )
+            if not is_done:
+                rebuilt[sid] = ns
+
+    with _pool_lock:
+        _claimed = rebuilt
+    logger.info("Rebuilt %d namespace claims from K8s", len(rebuilt))
+
+
 # ---- Namespace pool operations ----
 
 def claim_namespace(session_id: str) -> str:
@@ -129,7 +154,6 @@ def claim_namespace(session_id: str) -> str:
         for ns in pool:
             if ns not in in_use:
                 _claimed[session_id] = ns
-                _save_claims()
                 logger.info("Claimed namespace %s for session %s", ns, session_id)
                 return ns
 
@@ -144,7 +168,6 @@ def release_namespace(session_id: str) -> None:
     with _pool_lock:
         ns = _claimed.pop(session_id, None)
         if ns:
-            _save_claims()
             logger.info("Released namespace %s from session %s", ns, session_id)
 
 
@@ -163,6 +186,97 @@ def list_active_claims() -> list[dict]:
         ]
 
 
+# ---- Annotation helpers ----
+
+def _ann(key: str) -> str:
+    """Return the fully-qualified annotation key."""
+    return f"{ANNOTATION_PREFIX}/{key}"
+
+
+def get_job_annotations(namespace: str, job_name: str) -> dict[str, str]:
+    """Read annotations from a Job. Returns empty dict on 404."""
+    _init()
+    try:
+        job = _batch_v1.read_namespaced_job(name=job_name, namespace=namespace)
+        return dict(job.metadata.annotations or {})
+    except ApiException:
+        return {}
+
+
+def patch_job_annotations(namespace: str, job_name: str,
+                          annotations: dict[str, str]) -> None:
+    """Strategic-merge-patch annotations onto a Job."""
+    _init()
+    try:
+        _batch_v1.patch_namespaced_job(
+            name=job_name,
+            namespace=namespace,
+            body={"metadata": {"annotations": annotations}},
+        )
+    except ApiException as exc:
+        logger.warning("Failed to patch annotations on Job %s/%s: %s",
+                       namespace, job_name, exc)
+
+
+def list_jobs_in_pool(label_selector: str = "app=rca-worker") -> list[client.V1Job]:
+    """Query all pool namespaces and return matching Jobs."""
+    _init()
+    result: list[client.V1Job] = []
+    try:
+        pool = _load_pool()
+    except RuntimeError:
+        return result
+    for ns in pool:
+        try:
+            jobs = _batch_v1.list_namespaced_job(
+                namespace=ns, label_selector=label_selector,
+            )
+            result.extend(jobs.items)
+        except ApiException:
+            continue
+    return result
+
+
+# ---- Secret copying ----
+
+def _copy_secrets_to_namespace(target_namespace: str) -> None:
+    """Copy GCP and app-config secrets from the control cluster to the jobs cluster namespace."""
+    _init()
+    for secret_name in (GCP_SECRET_NAME, APP_CONFIG_SECRET_NAME):
+        try:
+            source = _control_core_v1.read_namespaced_secret(
+                name=secret_name, namespace=K8S_NAMESPACE,
+            )
+        except ApiException as exc:
+            raise RuntimeError(
+                f"Cannot read secret {secret_name} from {K8S_NAMESPACE}: {exc}"
+            )
+
+        target = client.V1Secret(
+            metadata=client.V1ObjectMeta(
+                name=secret_name, namespace=target_namespace,
+            ),
+            data=source.data,
+            type=source.type,
+        )
+
+        try:
+            _jobs_core_v1.create_namespaced_secret(
+                namespace=target_namespace, body=target,
+            )
+            logger.info("Created secret %s in namespace %s",
+                        secret_name, target_namespace)
+        except ApiException as exc:
+            if exc.status == 409:
+                _jobs_core_v1.replace_namespaced_secret(
+                    name=secret_name, namespace=target_namespace, body=target,
+                )
+                logger.info("Updated secret %s in namespace %s",
+                            secret_name, target_namespace)
+            else:
+                raise
+
+
 # ---- Job management ----
 
 def _job_name(session_id: str) -> str:
@@ -176,18 +290,24 @@ def create_remote_job(
     session_id: str,
     env_extras: list[client.V1EnvVar],
     worker_image: str = "",
+    callback_token: str = "",
+    initial_status: dict | None = None,
 ) -> str:
     """Create a K8s Job in a pre-provisioned namespace.
 
-    Secrets (GCP ADC, app-config, callback-token) are expected to already
-    exist in the namespace.  The Job spec uses emptyDir for scratch space
-    and has no pod affinity constraints.
+    Copies GCP ADC and app-config secrets from the API's control-cluster
+    namespace into the target namespace before creating the Job.
+
+    *callback_token* and *initial_status* are stored as Job annotations
+    so the API can read them back without local filesystem persistence.
     """
     _init()
 
     image = worker_image or WORKER_IMAGE
     if not image:
         raise RuntimeError("WORKER_IMAGE is not set")
+
+    _copy_secrets_to_namespace(namespace)
 
     name = _job_name(session_id)
 
@@ -222,11 +342,11 @@ def create_remote_job(
         ),
         client.V1Volume(
             name="gcloud-adc",
-            secret=client.V1SecretVolumeSource(secret_name="gcloud-adc-secret"),
+            secret=client.V1SecretVolumeSource(secret_name=GCP_SECRET_NAME),
         ),
         client.V1Volume(
             name="app-config-secret",
-            secret=client.V1SecretVolumeSource(secret_name="must-gather-app-config"),
+            secret=client.V1SecretVolumeSource(secret_name=APP_CONFIG_SECRET_NAME),
         ),
     ]
 
@@ -246,6 +366,15 @@ def create_remote_job(
     safe_owner = _env_extras_get(env_extras, "OWNER", "unknown")
     safe_owner = safe_owner.replace(" ", "_").replace(":", "_")[:63]
 
+    annotations = {}
+    if callback_token:
+        annotations[_ann("callback-token")] = callback_token
+    if initial_status:
+        annotations[_ann("status")] = json.dumps(initial_status)
+    annotations[_ann("deepening-round")] = str(
+        initial_status.get("deepening_round", 0) if initial_status else 0
+    )
+
     job = client.V1Job(
         api_version="batch/v1",
         kind="Job",
@@ -257,6 +386,7 @@ def create_remote_job(
                 "session-id": session_id[:63],
                 "owner": safe_owner,
             },
+            annotations=annotations,
         ),
         spec=client.V1JobSpec(
             template=client.V1PodTemplateSpec(

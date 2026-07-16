@@ -60,10 +60,9 @@ MUST_GATHER_EXTRACT_DIR = Path(os.environ.get("MUST_GATHER_EXTRACT_DIR", "/data/
 SHARED_PVC_MOUNT = Path(os.environ.get("SHARED_PVC_MOUNT", "/shared"))
 
 JOBS_CLUSTER_MODE: str = os.environ.get("JOBS_CLUSTER_MODE", "disabled")
-LOCAL_SESSION_DIR: str = os.environ.get("LOCAL_SESSION_DIR", "/data/sessions")
 
 if JOBS_CLUSTER_MODE == "enabled":
-    UPLOAD_DIR = Path(LOCAL_SESSION_DIR) / "_uploads"
+    UPLOAD_DIR = Path("/tmp/rca_uploads")
 else:
     UPLOAD_DIR = SHARED_PVC_MOUNT / "_uploads"
 
@@ -344,7 +343,7 @@ def _hydra_download_specific(case_number: str, attachment_uuid: str, filename: s
 
 # ── Background download tracking (file-based, shared across worker processes) ─
 if JOBS_CLUSTER_MODE == "enabled":
-    _DOWNLOAD_STATUS_DIR = Path(LOCAL_SESSION_DIR) / "_download_status"
+    _DOWNLOAD_STATUS_DIR = Path("/tmp/rca_download_status")
 else:
     _DOWNLOAD_STATUS_DIR = SHARED_PVC_MOUNT / "_download_status"
 _DOWNLOAD_STATUS_DIR.mkdir(parents=True, exist_ok=True)
@@ -507,25 +506,73 @@ def _resolve_session_id(session_id: str | None) -> str | None:
     return session_id or None
 
 
-def _restore_agent_memory_from_pvc(session_id: str) -> bool:
-    """Copy agent_memory.json from the shared PVC job directory into the API
-    pod's Config/ so OrchestratorAgent can find the session.
+def _restore_agent_memory(session_id: str) -> bool:
+    """Copy agent_memory.json into the API pod's Config/ directory.
 
+    In remote mode reads from GCS; in single-cluster mode reads from PVC.
     Returns True if the file was restored.
     """
-    src = job_runner.get_job_dir(session_id) / "agent_memory.json"
+    dest = get_memory_file_path()
+
+    if JOBS_CLUSTER_MODE == "enabled":
+        import object_storage
+        data = object_storage.read_bytes(session_id, "agent_memory.json")
+        if not data:
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        logger.info("Restored agent_memory.json from GCS for session %s", session_id)
+        return True
+
+    job_dir = job_runner.get_job_dir(session_id)
+    src = job_dir / "agent_memory.json"
     if not src.exists():
         return False
-    dest = get_memory_file_path()
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     logger.info("Restored agent_memory.json from PVC for session %s", session_id)
     return True
 
 
-def _job_results_dir(session_id: str) -> Path:
-    """Return the results directory for a session on the shared PVC."""
-    return job_runner.get_job_dir(session_id) / "results"
+def _read_result_file(session_id: str, filename: str) -> str | None:
+    """Read a result file — from GCS in remote mode, PVC in local mode."""
+    if JOBS_CLUSTER_MODE == "enabled":
+        import object_storage
+        return object_storage.read_text(session_id, f"results/{filename}")
+    job_dir = job_runner.get_job_dir(session_id)
+    path = job_dir / "results" / filename
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+    return None
+
+
+def _read_result_bytes(session_id: str, filename: str) -> bytes | None:
+    """Read a result file as bytes — from GCS in remote mode, PVC in local mode."""
+    if JOBS_CLUSTER_MODE == "enabled":
+        import object_storage
+        return object_storage.read_bytes(session_id, f"results/{filename}")
+    job_dir = job_runner.get_job_dir(session_id)
+    path = job_dir / "results" / filename
+    if path.exists():
+        try:
+            return path.read_bytes()
+        except Exception:
+            return None
+    return None
+
+
+def _job_results_dir(session_id: str) -> Path | None:
+    """Return the results directory for a session on the shared PVC.
+
+    Returns None in remote mode — callers should use _read_result_file().
+    """
+    job_dir = job_runner.get_job_dir(session_id)
+    if job_dir is None:
+        return None
+    return job_dir / "results"
 
 
 # ---------------------------------------------------------------------------
@@ -868,105 +915,129 @@ def analyze(request: AnalyzeRequest, req: Request = None):
 
     session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{secrets.token_hex(4)}"
 
-    job_dir = job_runner.get_job_dir(session_id)
-    job_input_dir = job_dir / "input"
-    job_input_dir.mkdir(parents=True, exist_ok=True)
-
-    if local_file_id:
-        # Move the raw archive into the job input dir — the worker pod
-        # will extract it (avoids blocking this HTTP request for minutes).
-        candidates = sorted(UPLOAD_DIR.glob(f"{local_file_id}.*"))
-        if not candidates:
-            raise HTTPException(status_code=404, detail=f"Upload '{local_file_id}' not found or expired")
-        archive_path = candidates[0]
-        dest_archive = job_input_dir / archive_path.name
-        try:
-            shutil.move(str(archive_path), str(dest_archive))
-        except Exception as e:
-            logger.exception("Failed to move archive %s to job dir", archive_path)
-            raise HTTPException(status_code=500, detail=f"Failed to prepare upload: {e}")
-        must_gather_base_dir = str(dest_archive)
-        logger.info("Moved archive %s → %s (extraction deferred to worker)", archive_path.name, dest_archive)
-    else:
-        must_gather_root_folder = (request.must_gather_root_folder or "").strip()
-        if not must_gather_root_folder:
-            must_gather_root_folder = _load_must_gather_base_dir_from_config()
-
-        if not must_gather_root_folder:
-            raise HTTPException(
-                status_code=400,
-                detail="must_gather_root_folder was not provided in the request and "
-                       "'must_gather_base_dir' is not set in Config/config.json.",
-            )
-
-        root_path = Path(must_gather_root_folder)
-        if not root_path.exists():
-            raise HTTPException(
-                status_code=400,
-                detail=f"must_gather_root_folder does not exist: {must_gather_root_folder}",
-            )
-        if not root_path.is_dir():
-            raise HTTPException(
-                status_code=400,
-                detail=f"must_gather_root_folder must be a directory: {must_gather_root_folder}",
-            )
-
-        resolved = root_path.resolve()
-
-        if not any(os.listdir(resolved)):
-            raise HTTPException(
-                status_code=400,
-                detail=f"must_gather_root_folder is empty: {must_gather_root_folder}. "
-                       "Please upload a must-gather archive instead.",
-            )
-
-        shared_pvc = Path(SHARED_PVC_MOUNT).resolve()
-        if not str(resolved).startswith(str(shared_pvc)):
-            logger.info(
-                "must_gather_root_folder %s is not on shared PVC (%s); "
-                "copying to job input dir %s",
-                resolved, shared_pvc, job_input_dir,
-            )
-            dest = job_input_dir / resolved.name
-            try:
-                shutil.copytree(str(resolved), str(dest), dirs_exist_ok=True)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to copy must-gather data to shared PVC: {e}",
-                )
-            must_gather_base_dir = str(dest)
-        else:
-            must_gather_base_dir = str(resolved)
-
     owner = (_get_authenticated_user(req) if req else "") or (request.owner or "").strip() or "unknown"
 
-    # Write initial status.json before creating the Job so the worker
-    # inherits problem_statement / case_number / owner from the start.
-    status_file = job_dir / "status.json"
-    status_file.write_text(json.dumps({
-        "session_id": session_id,
-        "status": "pending",
-        "phase": "queued",
-        "progress": 0,
-        "problem_statement": user_query,
-        "case_number": getattr(request, "case_number", "") or "",
-        "owner": owner,
-    }, indent=2), encoding="utf-8")
+    if JOBS_CLUSTER_MODE == "enabled":
+        # Remote mode: upload archive to GCS, no local job_dir needed.
+        archive_path = None
+        must_gather_base_dir = ""
+        if local_file_id:
+            candidates = sorted(UPLOAD_DIR.glob(f"{local_file_id}.*"))
+            if not candidates:
+                raise HTTPException(status_code=404, detail=f"Upload '{local_file_id}' not found or expired")
+            archive_path = candidates[0]
+            must_gather_base_dir = str(archive_path)
+        try:
+            job_runner.create_analysis_job(
+                session_id=session_id,
+                user_query=user_query,
+                must_gather_base_dir=must_gather_base_dir,
+                owner=owner,
+                archive_local_path=archive_path,
+            )
+        except Exception as e:
+            logger.exception("Failed to create K8s Job for session %s", session_id)
+            raise HTTPException(status_code=500, detail=f"Failed to create analysis job: {e}")
+        # Clean up the upload file after it's been sent to GCS.
+        if archive_path and archive_path.exists():
+            try:
+                archive_path.unlink()
+            except Exception:
+                pass
+    else:
+        job_dir = job_runner.get_job_dir(session_id)
+        job_input_dir = job_dir / "input"
+        job_input_dir.mkdir(parents=True, exist_ok=True)
 
-    archive_path = Path(must_gather_base_dir) if Path(must_gather_base_dir).is_file() else None
+        if local_file_id:
+            candidates = sorted(UPLOAD_DIR.glob(f"{local_file_id}.*"))
+            if not candidates:
+                raise HTTPException(status_code=404, detail=f"Upload '{local_file_id}' not found or expired")
+            archive_path = candidates[0]
+            dest_archive = job_input_dir / archive_path.name
+            try:
+                shutil.move(str(archive_path), str(dest_archive))
+            except Exception as e:
+                logger.exception("Failed to move archive %s to job dir", archive_path)
+                raise HTTPException(status_code=500, detail=f"Failed to prepare upload: {e}")
+            must_gather_base_dir = str(dest_archive)
+            logger.info("Moved archive %s → %s (extraction deferred to worker)", archive_path.name, dest_archive)
+        else:
+            must_gather_root_folder = (request.must_gather_root_folder or "").strip()
+            if not must_gather_root_folder:
+                must_gather_root_folder = _load_must_gather_base_dir_from_config()
 
-    try:
-        job_runner.create_analysis_job(
-            session_id=session_id,
-            user_query=user_query,
-            must_gather_base_dir=must_gather_base_dir,
-            owner=owner,
-            archive_local_path=archive_path,
-        )
-    except Exception as e:
-        logger.exception("Failed to create K8s Job for session %s", session_id)
-        raise HTTPException(status_code=500, detail=f"Failed to create analysis job: {e}")
+            if not must_gather_root_folder:
+                raise HTTPException(
+                    status_code=400,
+                    detail="must_gather_root_folder was not provided in the request and "
+                           "'must_gather_base_dir' is not set in Config/config.json.",
+                )
+
+            root_path = Path(must_gather_root_folder)
+            if not root_path.exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"must_gather_root_folder does not exist: {must_gather_root_folder}",
+                )
+            if not root_path.is_dir():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"must_gather_root_folder must be a directory: {must_gather_root_folder}",
+                )
+
+            resolved = root_path.resolve()
+
+            if not any(os.listdir(resolved)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"must_gather_root_folder is empty: {must_gather_root_folder}. "
+                           "Please upload a must-gather archive instead.",
+                )
+
+            shared_pvc = Path(SHARED_PVC_MOUNT).resolve()
+            if not str(resolved).startswith(str(shared_pvc)):
+                logger.info(
+                    "must_gather_root_folder %s is not on shared PVC (%s); "
+                    "copying to job input dir %s",
+                    resolved, shared_pvc, job_input_dir,
+                )
+                dest = job_input_dir / resolved.name
+                try:
+                    shutil.copytree(str(resolved), str(dest), dirs_exist_ok=True)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to copy must-gather data to shared PVC: {e}",
+                    )
+                must_gather_base_dir = str(dest)
+            else:
+                must_gather_base_dir = str(resolved)
+
+        status_file = job_dir / "status.json"
+        status_file.write_text(json.dumps({
+            "session_id": session_id,
+            "status": "pending",
+            "phase": "queued",
+            "progress": 0,
+            "problem_statement": user_query,
+            "case_number": getattr(request, "case_number", "") or "",
+            "owner": owner,
+        }, indent=2), encoding="utf-8")
+
+        archive_path = Path(must_gather_base_dir) if Path(must_gather_base_dir).is_file() else None
+
+        try:
+            job_runner.create_analysis_job(
+                session_id=session_id,
+                user_query=user_query,
+                must_gather_base_dir=must_gather_base_dir,
+                owner=owner,
+                archive_local_path=archive_path,
+            )
+        except Exception as e:
+            logger.exception("Failed to create K8s Job for session %s", session_id)
+            raise HTTPException(status_code=500, detail=f"Failed to create analysis job: {e}")
 
     return AnalyzeResponse(
         status="started",
@@ -999,15 +1070,22 @@ def cancel_analysis(session_id: str):
 
 @app.get("/agent-memory")
 def get_agent_memory(session_id: str | None = Query(default=None)):
-    """Return agent_memory.json scoped to a specific session on the PVC."""
+    """Return agent_memory.json scoped to a specific session."""
     if session_id:
-        pvc_mem = job_runner.get_job_dir(session_id) / "agent_memory.json"
-        if pvc_mem.exists():
-            try:
-                with open(pvc_mem, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+        if JOBS_CLUSTER_MODE == "enabled":
+            import object_storage
+            data = object_storage.read_json(session_id, "agent_memory.json")
+            if data:
+                return JSONResponse(content=data)
+        else:
+            job_dir = job_runner.get_job_dir(session_id)
+            pvc_mem = job_dir / "agent_memory.json"
+            if pvc_mem.exists():
+                try:
+                    with open(pvc_mem, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
 
     return JSONResponse(content={"sessions": [], "metadata": {}})
 
@@ -1017,12 +1095,9 @@ def get_workflow_console(session_id: str | None = Query(default=None), session: 
     """Return workflow_console.txt from the job's results directory."""
     sid = _resolve_session_id(session_id or session)
     if sid:
-        console_path = _job_results_dir(sid) / "workflow_console.txt"
-        if console_path.exists():
-            try:
-                return PlainTextResponse(console_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to read workflow_console.txt: {e}")
+        text = _read_result_file(sid, "workflow_console.txt")
+        if text is not None:
+            return PlainTextResponse(text)
 
     return PlainTextResponse("No workflow console output yet.", status_code=200)
 
@@ -1032,12 +1107,9 @@ def get_rca_summary(session_id: str | None = Query(default=None), session: str |
     """Return rca_summary.txt from the job's results directory."""
     sid = _resolve_session_id(session_id or session)
     if sid:
-        rca_path = _job_results_dir(sid) / "rca_summary.txt"
-        if rca_path.exists():
-            try:
-                return PlainTextResponse(rca_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to read rca_summary.txt: {e}")
+        text = _read_result_file(sid, "rca_summary.txt")
+        if text is not None:
+            return PlainTextResponse(text)
 
     return PlainTextResponse("No RCA summary available yet.", status_code=200)
 
@@ -1058,12 +1130,9 @@ def get_rca_stage(stage: str, session_id: str | None = Query(default=None), sess
 
     sid = _resolve_session_id(session_id or session)
     if sid:
-        rca_path = _job_results_dir(sid) / filename
-        if rca_path.exists():
-            try:
-                return PlainTextResponse(rca_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to read {filename}: {e}")
+        text = _read_result_file(sid, filename)
+        if text is not None:
+            return PlainTextResponse(text)
 
     return PlainTextResponse("", status_code=204)
 
@@ -1098,12 +1167,9 @@ def get_rca_report_summary(session_id: str | None = Query(default=None), session
     """Return the pre-generated RCA report summary."""
     sid = _resolve_session_id(session_id or session)
     if sid:
-        summary_path = _job_results_dir(sid) / "rca_report_summary.txt"
-        if summary_path.exists():
-            try:
-                return PlainTextResponse(summary_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to read rca_report_summary.txt: {e}")
+        text = _read_result_file(sid, "rca_report_summary.txt")
+        if text is not None:
+            return PlainTextResponse(text)
 
     return PlainTextResponse("", status_code=204)
 
@@ -1180,14 +1246,12 @@ def get_rca_bundle_zip(session_id: str | None = Query(default=None), session: st
     sid = _resolve_session_id(session_id or session)
     if not sid:
         raise HTTPException(status_code=400, detail="session_id is required")
-    results_dir = _job_results_dir(sid)
 
     doc_entries: list[tuple[str, str | bytes]] = []
     for disk_name, arc_name in _RCA_STAGE_FILES:
-        src = results_dir / disk_name
-        if not (src.is_file() and src.stat().st_size > 0):
+        text = _read_result_file(sid, disk_name)
+        if not text or not text.strip():
             continue
-        text = src.read_text(encoding="utf-8", errors="replace")
         title = arc_name.rsplit(".", 1)[0].replace("_", " ")
         dag_png = _load_stage_dag_png(results_dir, disk_name)
         append_rca_stage_bundle_entries(
@@ -1846,23 +1910,30 @@ def _build_logging_tracing_doc_html(session: dict, last_rca_text: str) -> str:
     return _build_word_doc_html_rich("Logging / Tracing", body)
 
 
-def _read_session_from_pvc(sid: str) -> dict:
-    """Read session data from the shared PVC (authoritative source).
+def _read_session_data(sid: str) -> dict:
+    """Read session data (authoritative source).
 
-    Checks both session_id and api_session_id to handle the internal-vs-API
-    ID mismatch.  Falls back to _read_session_by_id (local agent_memory) if
-    the PVC file is missing so existing behaviour is preserved.
+    In remote mode reads from GCS; in local mode from the shared PVC.
+    Falls back to _read_session_by_id (local agent_memory).
     """
-    pvc_mem = job_runner.get_job_dir(sid) / "agent_memory.json"
-    if pvc_mem.exists():
-        try:
-            with open(pvc_mem, "r", encoding="utf-8") as f:
-                mem = json.load(f)
-            for s in reversed(mem.get("sessions", [])):
-                if s.get("session_id") == sid or s.get("api_session_id") == sid:
-                    return s
-        except Exception:
-            pass
+    mem = None
+    if JOBS_CLUSTER_MODE == "enabled":
+        import object_storage
+        mem = object_storage.read_json(sid, "agent_memory.json")
+    else:
+        job_dir = job_runner.get_job_dir(sid)
+        pvc_mem = job_dir / "agent_memory.json"
+        if pvc_mem.exists():
+            try:
+                with open(pvc_mem, "r", encoding="utf-8") as f:
+                    mem = json.load(f)
+            except Exception:
+                pass
+
+    if mem:
+        for s in reversed(mem.get("sessions", [])):
+            if s.get("session_id") == sid or s.get("api_session_id") == sid:
+                return s
     return _read_session_by_id(sid)
 
 
@@ -1872,16 +1943,14 @@ def download_full_bundle_zip(session_id: str | None = Query(default=None), sessi
     sid = _resolve_session_id(session_id or session)
     if not sid:
         raise HTTPException(status_code=400, detail="session_id is required")
-    results_dir = _job_results_dir(sid)
 
-    session_data = _read_session_from_pvc(sid)
+    session_data = _read_session_data(sid)
     doc_entries: list[tuple[str, str | bytes]] = []
 
     for disk_name, arc_name in _RCA_STAGE_FILES:
-        src = results_dir / disk_name
-        if not (src.is_file() and src.stat().st_size > 0):
+        text = _read_result_file(sid, disk_name)
+        if not text or not text.strip():
             continue
-        text = src.read_text(encoding="utf-8", errors="replace")
         title = arc_name.rsplit(".", 1)[0].replace("_", " ")
         dag_png = _load_stage_dag_png(results_dir, disk_name)
         append_rca_stage_bundle_entries(
@@ -1893,14 +1962,13 @@ def download_full_bundle_zip(session_id: str | None = Query(default=None), sessi
             dag_png=dag_png,
         )
 
-    summary_src = results_dir / "rca_report_summary.txt"
-    if summary_src.is_file() and summary_src.stat().st_size > 0:
-        exec_summary = summary_src.read_text(encoding="utf-8", errors="replace")
+    exec_summary = _read_result_file(sid, "rca_report_summary.txt")
+    if exec_summary and exec_summary.strip():
         latest_rca = ""
         for dname, _ in reversed(_RCA_STAGE_FILES):
-            s = results_dir / dname
-            if s.is_file() and s.stat().st_size > 0:
-                latest_rca = s.read_text(encoding="utf-8", errors="replace")
+            t = _read_result_file(sid, dname)
+            if t and t.strip():
+                latest_rca = t
                 break
         resolution_md = _extract_resolution_section(latest_rca)
         doc_entries.append(("RCA_Summary.doc", "\ufeff" + _build_rca_summary_doc_html(exec_summary, resolution_md)))
@@ -1914,9 +1982,9 @@ def download_full_bundle_zip(session_id: str | None = Query(default=None), sessi
 
     last_rca_text = ""
     for disk_name, _ in reversed(_RCA_STAGE_FILES):
-        src = results_dir / disk_name
-        if src.is_file() and src.stat().st_size > 0:
-            last_rca_text = src.read_text(encoding="utf-8", errors="replace")
+        t = _read_result_file(sid, disk_name)
+        if t and t.strip():
+            last_rca_text = t
             break
     if session_data or last_rca_text:
         lt_html = _build_logging_tracing_doc_html(session_data, last_rca_text)
@@ -1961,7 +2029,7 @@ def submit_feedback(req: FeedbackRequest):
     try:
         api_sid = req.session_id
 
-        _restore_agent_memory_from_pvc(api_sid)
+        _restore_agent_memory(api_sid)
 
         orch = OrchestratorAgent(reset=False)
 
@@ -2069,6 +2137,10 @@ async def callback_get_input(session_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+_console_buffers: dict[str, str] = {}
+_console_lock = threading.Lock()
+
+
 @app.post("/callback/status")
 async def callback_post_status(request: Request):
     """Receive a status update from a worker."""
@@ -2079,26 +2151,7 @@ async def callback_post_status(request: Request):
 
     _verify_callback_token(request, session_id)
 
-    job_dir = job_runner.get_job_dir(session_id)
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    status_file = job_dir / "status.json"
-    existing = {}
-    if status_file.exists():
-        try:
-            existing = json.loads(status_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    for key in ("owner", "problem_statement", "case_number", "deepening_round", "_callback_token"):
-        if key not in body and key in existing:
-            body[key] = existing[key]
-
-    body["updated_at"] = datetime.now().isoformat()
-
-    tmp = job_dir / "status.json.tmp"
-    tmp.write_text(json.dumps(body, indent=2), encoding="utf-8")
-    tmp.rename(status_file)
+    job_runner._write_remote_status(session_id, body)
 
     if body.get("status") in ("completed", "error"):
         import asyncio
@@ -2111,38 +2164,51 @@ async def callback_post_status(request: Request):
 
 @app.post("/callback/results/{session_id}")
 async def callback_post_results(session_id: str, request: Request):
-    """Receive results tarball from a worker."""
+    """Receive results tarball from a worker and store in GCS."""
     _verify_callback_token(request, session_id)
 
-    job_dir = job_runner.get_job_dir(session_id)
-    results_dir = job_dir / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
+    import object_storage
+    import tempfile
 
     body = await request.body()
 
-    import io as _io
-    import tarfile as _tarfile
-    buf = _io.BytesIO(body)
+    buf = io.BytesIO(body)
+    count = 0
     try:
-        with _tarfile.open(fileobj=buf, mode="r:gz") as tar:
-            tar.extractall(path=str(results_dir))
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tar.extractall(path=tmpdir)
+                for item in Path(tmpdir).iterdir():
+                    if item.is_file():
+                        object_storage.write_bytes(
+                            session_id, f"results/{item.name}",
+                            item.read_bytes(),
+                        )
+                        count += 1
+                    elif item.is_dir():
+                        for sub in item.rglob("*"):
+                            if sub.is_file():
+                                rel = sub.relative_to(Path(tmpdir))
+                                object_storage.write_bytes(
+                                    session_id, f"results/{rel}",
+                                    sub.read_bytes(),
+                                )
+                                count += 1
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to extract results tar: {e}")
 
-    return {"status": "ok", "files_received": len(list(results_dir.iterdir()))}
+    return {"status": "ok", "files_received": count}
 
 
 @app.post("/callback/agent-memory/{session_id}")
 async def callback_post_agent_memory(session_id: str, request: Request):
-    """Receive agent_memory.json from a worker."""
+    """Receive agent_memory.json from a worker and store in GCS."""
     _verify_callback_token(request, session_id)
 
-    job_dir = job_runner.get_job_dir(session_id)
-    job_dir.mkdir(parents=True, exist_ok=True)
-
+    import object_storage
     body = await request.body()
-    dest = job_dir / "agent_memory.json"
-    dest.write_bytes(body)
+    object_storage.write_bytes(session_id, "agent_memory.json", body,
+                               content_type="application/json")
 
     return {"status": "ok"}
 
@@ -2152,36 +2218,43 @@ async def callback_get_agent_memory(session_id: str, request: Request):
     """Serve agent_memory.json to a worker (for deepening rounds)."""
     _verify_callback_token(request, session_id)
 
-    job_dir = job_runner.get_job_dir(session_id)
-    mem_file = job_dir / "agent_memory.json"
-    if not mem_file.exists():
+    import object_storage
+    data = object_storage.read_json(session_id, "agent_memory.json")
+    if data is None:
         raise HTTPException(status_code=404, detail="No agent memory found")
 
-    return JSONResponse(content=json.loads(mem_file.read_text(encoding="utf-8")))
+    return JSONResponse(content=data)
 
 
 @app.post("/callback/console/{session_id}")
 async def callback_post_console(session_id: str, request: Request):
-    """Append console log text from a worker."""
+    """Receive console log text from a worker, buffer and write to GCS."""
     _verify_callback_token(request, session_id)
 
-    job_dir = job_runner.get_job_dir(session_id)
-    console_path = job_dir / "results" / "workflow_console.txt"
-    console_path.parent.mkdir(parents=True, exist_ok=True)
-
+    import object_storage
     body = await request.body()
-    with open(console_path, "ab") as f:
-        f.write(body)
+    text = body.decode("utf-8", errors="replace")
+
+    with _console_lock:
+        _console_buffers[session_id] = _console_buffers.get(session_id, "") + text
+        full_text = _console_buffers[session_id]
+
+    try:
+        object_storage.write_text(session_id, "results/workflow_console.txt", full_text)
+    except Exception:
+        logger.warning("Failed to write console buffer to GCS for %s", session_id)
 
     return {"status": "ok"}
 
 
 def _schedule_remote_cleanup(session_id: str) -> None:
-    """Trigger cleanup of remote namespace and GCS objects."""
+    """Trigger cleanup of remote namespace and archive."""
     try:
         job_runner.trigger_remote_cleanup(session_id)
     except Exception:
         logger.exception("Failed to clean up remote resources for session %s", session_id)
+    with _console_lock:
+        _console_buffers.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2194,7 +2267,6 @@ async def _startup_cross_cluster():
     if JOBS_CLUSTER_MODE != "enabled":
         return
 
-    Path(LOCAL_SESSION_DIR).mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -2204,46 +2276,35 @@ async def _startup_cross_cluster():
 
 
 def _reconcile_running_sessions() -> None:
-    """On startup, check for sessions that were running when the API restarted."""
+    """On startup, check Jobs on the remote cluster and fix stale state."""
     if JOBS_CLUSTER_MODE != "enabled":
         return
 
     import remote_cluster
 
-    jobs_root = Path(LOCAL_SESSION_DIR) / "jobs"
-    if not jobs_root.is_dir():
-        return
+    for job in remote_cluster.list_jobs_in_pool("app=rca-worker"):
+        sid = (job.metadata.labels or {}).get("session-id", "")
+        if not sid:
+            continue
 
-    for sid_dir in jobs_root.iterdir():
-        if not sid_dir.is_dir():
-            continue
-        status_file = sid_dir / "status.json"
-        if not status_file.exists():
-            continue
+        ann = dict(job.metadata.annotations or {})
+        status_json = ann.get(remote_cluster._ann("status"), "")
         try:
-            data = json.loads(status_file.read_text(encoding="utf-8"))
+            status = json.loads(status_json) if status_json else {}
         except Exception:
-            continue
-        if data.get("status") != "running":
+            status = {}
+
+        if status.get("status") in ("completed", "error", "cancelled"):
             continue
 
-        sid = sid_dir.name
-        ns = remote_cluster.get_namespace_for_session(sid)
-        if not ns:
-            data["status"] = "error"
-            data["message"] = "No namespace claim found after API restart"
-            data["updated_at"] = datetime.now().isoformat()
-            status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            logger.info("Reconciliation: marked session %s as error (no namespace claim)", sid)
-            continue
-        name = f"rca-{sid.lower().replace('_', '-')}"[:63]
+        ns = job.metadata.namespace
+        name = job.metadata.name
         try:
             phase = remote_cluster.get_job_phase(ns, name)
             if phase == "failed":
-                data["status"] = "error"
-                data["message"] = "Worker failed during API restart"
-                data["updated_at"] = datetime.now().isoformat()
-                status_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                status["status"] = "error"
+                status["message"] = "Worker failed during API restart"
+                job_runner._write_remote_status(sid, status)
                 logger.info("Reconciliation: marked session %s as error (job failed)", sid)
         except Exception:
             pass
