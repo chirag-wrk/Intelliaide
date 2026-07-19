@@ -23,6 +23,7 @@ FEEDBACK_TEXT            (deepening only) User feedback text.
 COMMS_MODE            "pvc" (default) or "callback".
 API_CALLBACK_URL      (callback only) Base URL of the API for callbacks.
 CALLBACK_TOKEN        (callback only) Bearer token for callback auth.
+CALLBACK_VERIFY_SSL   (callback only) "true"/"false" TLS cert verification.
 """
 
 import json

@@ -23,12 +23,27 @@ import time
 from pathlib import Path
 
 import requests
+import urllib3
 
 logger = logging.getLogger(__name__)
 
 COMMS_MODE: str = os.environ.get("COMMS_MODE", "pvc")
 API_CALLBACK_URL: str = os.environ.get("API_CALLBACK_URL", "").rstrip("/")
 CALLBACK_TOKEN: str = os.environ.get("CALLBACK_TOKEN", "")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Callback TLS verification defaults to off for cross-cluster OpenShift routes
+# that may present an internal/self-signed chain to worker pods.
+CALLBACK_VERIFY_SSL: bool = _env_bool("CALLBACK_VERIFY_SSL", False)
+if not CALLBACK_VERIFY_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2
@@ -56,18 +71,20 @@ def _post(path: str, *, json_body: dict | None = None,
         try:
             if json_body is not None:
                 resp = requests.post(url, json=json_body, headers=headers,
-                                     timeout=timeout)
+                                     timeout=timeout, verify=CALLBACK_VERIFY_SSL)
             elif stream_file is not None:
                 headers["Content-Type"] = content_type
                 with open(stream_file, "rb") as f:
                     resp = requests.post(url, data=f, headers=headers,
-                                         timeout=timeout)
+                                         timeout=timeout, verify=CALLBACK_VERIFY_SSL)
             elif data is not None:
                 headers["Content-Type"] = content_type
                 resp = requests.post(url, data=data, headers=headers,
-                                     timeout=timeout)
+                                     timeout=timeout, verify=CALLBACK_VERIFY_SSL)
             else:
-                resp = requests.post(url, headers=headers, timeout=timeout)
+                resp = requests.post(
+                    url, headers=headers, timeout=timeout, verify=CALLBACK_VERIFY_SSL
+                )
 
             resp.raise_for_status()
             return resp
@@ -97,7 +114,7 @@ def _get(path: str, *, timeout: int = 600,
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             resp = requests.get(url, headers=headers, timeout=timeout,
-                                stream=stream)
+                                stream=stream, verify=CALLBACK_VERIFY_SSL)
             resp.raise_for_status()
             return resp
 

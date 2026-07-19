@@ -47,6 +47,7 @@ WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
 
 JOBS_CLUSTER_MODE: str = os.environ.get("JOBS_CLUSTER_MODE", "disabled")
 API_CALLBACK_URL: str = os.environ.get("API_CALLBACK_URL", "")
+CALLBACK_VERIFY_SSL: str = os.environ.get("CALLBACK_VERIFY_SSL", "false")
 
 # ---------------------------------------------------------------------------
 # K8s client initialisation (lazy, once)
@@ -773,6 +774,7 @@ def _create_remote_analysis_job(
         client.V1EnvVar(name="COMMS_MODE", value="callback"),
         client.V1EnvVar(name="API_CALLBACK_URL", value=API_CALLBACK_URL),
         client.V1EnvVar(name="CALLBACK_TOKEN", value=callback_token),
+        client.V1EnvVar(name="CALLBACK_VERIFY_SSL", value=CALLBACK_VERIFY_SSL),
     ]
 
     name = remote_cluster.create_remote_job(
@@ -839,6 +841,7 @@ def _create_remote_deepening_job(
         client.V1EnvVar(name="COMMS_MODE", value="callback"),
         client.V1EnvVar(name="API_CALLBACK_URL", value=API_CALLBACK_URL),
         client.V1EnvVar(name="CALLBACK_TOKEN", value=callback_token),
+        client.V1EnvVar(name="CALLBACK_VERIFY_SSL", value=CALLBACK_VERIFY_SSL),
     ]
 
     name = remote_cluster.create_remote_job(
