@@ -40,9 +40,9 @@ LOG_CONFIGMAP_NAME: str = os.environ.get("LOG_CONFIGMAP_NAME", "must-gather-log-
 JOB_ACTIVE_DEADLINE: int = int(os.environ.get("JOB_ACTIVE_DEADLINE_SECONDS", "3600"))
 JOB_TTL_AFTER_FINISHED: int = int(os.environ.get("JOB_TTL_AFTER_FINISHED", "600"))
 
-WORKER_CPU_REQUEST: str = os.environ.get("WORKER_CPU_REQUEST", "250m")
-WORKER_CPU_LIMIT: str = os.environ.get("WORKER_CPU_LIMIT", "2000m")
-WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "512Mi")
+WORKER_CPU_REQUEST: str = os.environ.get("WORKER_CPU_REQUEST", "1")
+WORKER_CPU_LIMIT: str = os.environ.get("WORKER_CPU_LIMIT", "2")
+WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "1Gi")
 WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
 
 JOBS_CLUSTER_MODE: str = os.environ.get("JOBS_CLUSTER_MODE", "disabled")

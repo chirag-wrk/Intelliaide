@@ -40,9 +40,9 @@ NAMESPACE_POOL_FILE: str = os.environ.get(
 )
 
 WORKER_IMAGE: str = os.environ.get("WORKER_IMAGE", "")
-WORKER_CPU_REQUEST: str = os.environ.get("WORKER_CPU_REQUEST", "250m")
-WORKER_CPU_LIMIT: str = os.environ.get("WORKER_CPU_LIMIT", "2000m")
-WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "512Mi")
+WORKER_CPU_REQUEST: str = os.environ.get("WORKER_CPU_REQUEST", "1")
+WORKER_CPU_LIMIT: str = os.environ.get("WORKER_CPU_LIMIT", "2")
+WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "1Gi")
 WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
 
 JOB_ACTIVE_DEADLINE: int = int(os.environ.get("JOB_ACTIVE_DEADLINE_SECONDS", "3600"))
@@ -172,9 +172,45 @@ def release_namespace(session_id: str) -> None:
 
 
 def get_namespace_for_session(session_id: str) -> str:
-    """Return the namespace assigned to a session, or empty string if none."""
+    """Return the namespace assigned to a session, or empty string if none.
+
+    This may be called from API worker processes that did not create the Job,
+    so in-memory claims can be empty. Fall back to rebuilding and then a direct
+    K8s lookup by session label to avoid callback auth mismatches.
+    """
     with _pool_lock:
-        return _claimed.get(session_id, "")
+        ns = _claimed.get(session_id, "")
+    if ns:
+        return ns
+
+    try:
+        _init()
+    except Exception:
+        return ""
+
+    with _pool_lock:
+        ns = _claimed.get(session_id, "")
+    if ns:
+        return ns
+
+    try:
+        pool = _load_pool()
+    except RuntimeError:
+        return ""
+
+    for ns in pool:
+        try:
+            jobs = _batch_v1.list_namespaced_job(
+                namespace=ns,
+                label_selector=f"app=rca-worker,session-id={session_id[:63]}",
+            )
+        except ApiException:
+            continue
+        if jobs.items:
+            with _pool_lock:
+                _claimed[session_id] = ns
+            return ns
+    return ""
 
 
 def list_active_claims() -> list[dict]:
