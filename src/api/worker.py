@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from datetime import datetime
@@ -132,20 +133,29 @@ def _maybe_extract_archive(must_gather_base_dir: str, job_dir: Path,
     extract_dir.mkdir(parents=True, exist_ok=True)
 
     size_gb = p.stat().st_size / (1024**3)
-    print(f"[Worker] Extracting archive {p.name} ({size_gb:.2f} GB) via CLI tar+pigz …")
+    print(f"[Worker] Extracting archive {p.name} ({size_gb:.2f} GB) …")
     name_lower = p.name.lower()
 
     if name_lower.endswith(".zip"):
         with zipfile.ZipFile(p, "r") as zf:
             zf.extractall(extract_dir)
     else:
-        if name_lower.endswith((".tar.gz", ".tgz")):
-            cmd = ["tar", "xf", str(p), "-C", str(extract_dir), "-I", "pigz"]
-        elif name_lower.endswith(".tar.bz2"):
-            cmd = ["tar", "xjf", str(p), "-C", str(extract_dir)]
-        else:
-            cmd = ["tar", "xf", str(p), "-C", str(extract_dir)]
-        subprocess.run(cmd, check=True)
+        try:
+            if name_lower.endswith((".tar.gz", ".tgz")):
+                if shutil.which("pigz"):
+                    cmd = ["tar", "xf", str(p), "-C", str(extract_dir), "-I", "pigz"]
+                else:
+                    cmd = ["tar", "xzf", str(p), "-C", str(extract_dir)]
+            elif name_lower.endswith(".tar.bz2"):
+                cmd = ["tar", "xjf", str(p), "-C", str(extract_dir)]
+            else:
+                cmd = ["tar", "xf", str(p), "-C", str(extract_dir)]
+            subprocess.run(cmd, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            # Fallback when tar/pigz flags are unavailable in minimal images.
+            print(f"[Worker] CLI extraction failed ({exc}); falling back to Python tarfile")
+            with tarfile.open(p, "r:*") as tf:
+                tf.extractall(extract_dir)
 
     p.unlink(missing_ok=True)
     resolved = _resolve_root(extract_dir)
