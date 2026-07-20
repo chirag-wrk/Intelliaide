@@ -16,7 +16,6 @@ import io
 import json
 import logging
 import os
-import shutil
 import tarfile
 import threading
 import time
@@ -211,15 +210,14 @@ def _write_status_pvc(job_dir: Path, status: dict) -> None:
 # Result upload
 # ---------------------------------------------------------------------------
 
-def upload_results(session_id: str, results_dir: Path,
-                   job_results_dir: Path | None = None) -> None:
-    """Upload analysis results.
+def upload_results(session_id: str, results_dir: Path) -> None:
+    """Upload analysis results to the API (callback mode only).
 
-    In callback mode, creates a tar archive and POSTs it to the API.
-    In PVC mode, copies files to the job results dir on the shared PVC.
+    Creates a tar archive of results_dir and POSTs it.
+    In PVC mode the orchestrator writes directly to the job results dir
+    (via the ``set_results_dir`` override), so no upload/copy is needed.
     """
     if not _is_callback():
-        _copy_results_pvc(results_dir, job_results_dir)
         return
 
     buf = io.BytesIO()
@@ -237,33 +235,19 @@ def upload_results(session_id: str, results_dir: Path,
     logger.info("Uploaded results for session %s (%d bytes)", session_id, len(tar_bytes))
 
 
-def _copy_results_pvc(results_dir: Path, job_results_dir: Path) -> None:
-    """Legacy PVC result copy."""
-    job_results_dir.mkdir(parents=True, exist_ok=True)
-    for item in results_dir.iterdir():
-        dest = job_results_dir / item.name
-        if item.is_file():
-            shutil.copy2(item, dest)
-        elif item.is_dir():
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(item, dest)
-
-
 # ---------------------------------------------------------------------------
 # Agent memory
 # ---------------------------------------------------------------------------
 
-def upload_agent_memory(session_id: str, memory_path: Path,
-                        job_dir: Path | None = None) -> None:
-    """Upload agent_memory.json to the API (or copy to PVC)."""
-    if not memory_path.exists():
-        return
+def upload_agent_memory(session_id: str, memory_path: Path) -> None:
+    """Upload agent_memory.json to the API (callback mode only).
 
+    In PVC mode the orchestrator writes directly to the job dir
+    (via the ``set_memory_file_path`` override), so no upload is needed.
+    """
     if not _is_callback():
-        if job_dir:
-            dest = job_dir / "agent_memory.json"
-            shutil.copy2(memory_path, dest)
+        return
+    if not memory_path.exists():
         return
 
     _post(
@@ -274,15 +258,13 @@ def upload_agent_memory(session_id: str, memory_path: Path,
     logger.info("Uploaded agent memory for session %s", session_id)
 
 
-def download_agent_memory(session_id: str, dest_path: Path,
-                          job_dir: Path | None = None) -> None:
-    """Download agent_memory.json from the API (or copy from PVC)."""
+def download_agent_memory(session_id: str, dest_path: Path) -> None:
+    """Download agent_memory.json from the API (callback mode only).
+
+    In PVC mode the memory file already lives in the job dir
+    (via the ``set_memory_file_path`` override), so no download is needed.
+    """
     if not _is_callback():
-        if job_dir:
-            src = job_dir / "agent_memory.json"
-            if src.exists():
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest_path)
         return
 
     try:

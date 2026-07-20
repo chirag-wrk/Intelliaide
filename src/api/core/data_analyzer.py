@@ -150,7 +150,7 @@ def _get_default_base_folder():
 DEFAULT_BASE_FOLDER = _get_default_base_folder()
 
 # Path to critical fields document (uses app_paths for frozen exe)
-from app_paths import get_keyfields_path, get_application_dir
+from app_paths import get_keyfields_path, get_results_dir
 KEYFIELDS_ODT_PATH = get_keyfields_path()
 
 # Load YAML processing configuration
@@ -2079,7 +2079,7 @@ class DataAnalyzer:
         # {"status", "files": {"rare_errors": {path, templates, lines}, ...}, "totals", ...}
         log_processing_result = {}
         if log_files and ML_LOG_CLASSIFICATION_AVAILABLE:
-            output_dir = str(get_application_dir() / "Results" / "log_classifications")
+            output_dir = str(get_results_dir() / "log_classifications")
             _level_map = {
                 "rare_errors": "RareError",
                 "highfreq_errors": "HighFreqError",
@@ -2254,7 +2254,7 @@ class DataAnalyzer:
                 pass
 
         # Store aggregated results JSON to file
-        results_output_path = get_application_dir() / "errors_aggregate.json"
+        results_output_path = get_results_dir() / "errors_aggregate.json"
 
         # Add metadata to output
         output_data = {

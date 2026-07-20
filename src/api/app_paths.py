@@ -74,26 +74,42 @@ def get_json_config_path() -> Path:
             return p
     return cfg_dir / "json_config.json"
 
-def get_log_config_path() -> Path:
-    """Log ML pipeline config: config/log_config.json (or bundled)."""
-    cfg_dir = get_config_dir()
-    res = get_resource_dir()
-    for d in (cfg_dir, get_application_dir(), res, res / "Config"):
-        p = d / "log_config.json"
-        if p.exists():
-            return p
-    return cfg_dir / "log_config.json"
+_memory_file_override: Path | None = None
+
+
+def set_memory_file_path(path: Path) -> None:
+    """Override the agent memory file path (used by the worker to write
+    directly into the job dir, avoiding writes to the read-only app dir)."""
+    global _memory_file_override
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _memory_file_override = path
+
 
 def get_memory_file_path() -> Path:
-    """Agent memory file: config/agent_memory.json."""
+    """Agent memory file: Config/agent_memory.json."""
+    if _memory_file_override is not None:
+        return _memory_file_override
     return get_config_dir() / "agent_memory.json"
 
 def get_must_gather_docs_dir() -> Path:
     """MUST_GATHER topology docs: data_source (MUST_GATHER_*.md)."""
     return get_data_source_dir()
 
+_results_dir_override: Path | None = None
+
+
+def set_results_dir(path: Path) -> None:
+    """Override the results directory (used by the worker to write directly
+    into the job results dir, avoiding a redundant copy)."""
+    global _results_dir_override
+    path.mkdir(parents=True, exist_ok=True)
+    _results_dir_override = path
+
+
 def get_results_dir() -> Path:
     """Results directory (errors_aggregate.json, rca_summary.txt, ML outputs)."""
+    if _results_dir_override is not None:
+        return _results_dir_override
     d = get_application_dir() / "Results"
     d.mkdir(parents=True, exist_ok=True)
     return d

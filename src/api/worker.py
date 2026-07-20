@@ -45,7 +45,7 @@ for p in (_root, _root / "core", _root / "machine_learning"):
 
 from orchestrator_agent import OrchestratorAgent, clear_agent_memory, _TeeWriter
 from must_gather_file_selector import MUST_GATHER_DOCS_DIR_DEFAULT
-from app_paths import get_results_dir, get_memory_file_path
+from app_paths import get_memory_file_path, set_results_dir, set_memory_file_path
 import worker_comms
 
 
@@ -64,16 +64,17 @@ def _write_status(job_dir: Path, status: dict) -> None:
     worker_comms.report_status(_SESSION_ID, status, job_dir=job_dir)
 
 
-def _copy_results_to_job(results_dir: Path, job_results_dir: Path) -> None:
-    """Upload/copy results via the appropriate channel."""
-    worker_comms.upload_results(_SESSION_ID, results_dir,
-                                job_results_dir=job_results_dir)
+def _upload_results_callback(results_dir: Path) -> None:
+    """In callback mode, upload results to the API."""
+    if worker_comms.COMMS_MODE == "callback":
+        worker_comms.upload_results(_SESSION_ID, results_dir)
 
 
-def _copy_agent_memory_to_job(job_dir: Path) -> None:
-    """Upload/copy agent_memory.json via the appropriate channel."""
-    mem_path = get_memory_file_path()
-    worker_comms.upload_agent_memory(_SESSION_ID, mem_path, job_dir=job_dir)
+def _upload_agent_memory_callback() -> None:
+    """In callback mode, upload agent_memory.json to the API."""
+    if worker_comms.COMMS_MODE == "callback":
+        mem_path = get_memory_file_path()
+        worker_comms.upload_agent_memory(_SESSION_ID, mem_path)
 
 
 def _cleanup_input(job_dir: Path, session_id: str) -> None:
@@ -170,7 +171,8 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
 
     job_results_dir = job_dir / "results"
     job_results_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = get_results_dir()
+    set_results_dir(job_results_dir)
+    set_memory_file_path(job_dir / "agent_memory.json")
 
     def progress_callback(event_type, message="", data=None):
         phase_map = {
@@ -234,8 +236,8 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
         output_session_id=session_id,
     )
 
-    _copy_results_to_job(results_dir, job_results_dir)
-    _copy_agent_memory_to_job(job_dir)
+    _upload_results_callback(job_results_dir)
+    _upload_agent_memory_callback()
 
     orch_status = result.get("status", "error")
     if orch_status != "error":
@@ -259,20 +261,21 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
         })
 
 
-def _restore_agent_memory(job_dir: Path) -> None:
-    """Restore agent_memory.json so the OrchestratorAgent can find the session."""
-    dest = get_memory_file_path()
-    worker_comms.download_agent_memory(_SESSION_ID, dest, job_dir=job_dir)
+def _restore_agent_memory_callback() -> None:
+    """In callback mode, download agent_memory.json from the API."""
+    if worker_comms.COMMS_MODE == "callback":
+        dest = get_memory_file_path()
+        worker_comms.download_agent_memory(_SESSION_ID, dest)
 
 
 def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
                    must_gather_base_dir: str, job_dir: Path) -> None:
     """Run a feedback / deepening round."""
-    _restore_agent_memory(job_dir)
-
     job_results_dir = job_dir / "results"
     job_results_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = get_results_dir()
+    set_results_dir(job_results_dir)
+    set_memory_file_path(job_dir / "agent_memory.json")
+    _restore_agent_memory_callback()
 
     def progress_callback(event_type, message="", data=None):
         phase_map = {
@@ -327,8 +330,8 @@ def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
         progress_callback=progress_callback,
     )
 
-    _copy_results_to_job(results_dir, job_results_dir)
-    _copy_agent_memory_to_job(job_dir)
+    _upload_results_callback(job_results_dir)
+    _upload_agent_memory_callback()
 
     if isinstance(result, dict) and result.get("status") == "error":
         _write_status(job_dir, {
