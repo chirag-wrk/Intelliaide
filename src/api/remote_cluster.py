@@ -2,7 +2,7 @@
 Remote Kubernetes cluster operations for cross-cluster job dispatch.
 
 Namespaces on the jobs cluster are **pre-provisioned in a pool** and made
-available via a ConfigMap mounted on the API pod.  This module claims a
+available via a ConfigMap mounted on the API pod.  This module picks a
 namespace from the pool, creates Jobs in it, and monitors them.  Namespace
 recycling after job completion is handled by an external operator — the API
 does not create or delete namespaces.  Secrets (GCP ADC, app-config) are
@@ -10,8 +10,8 @@ copied from the API's control-cluster namespace into the target namespace
 at Job creation time.
 
 The pool ConfigMap (mounted as a file) contains a JSON list of namespace
-names.  The API tracks which ones are in use in-memory; the mapping is
-rebuilt from live K8s state on startup (no local file persistence).
+names.  Active K8s Jobs are the sole source of truth for which namespaces
+are in use — there is no in-memory session-to-namespace mapping.
 
 Uses a dedicated kubeconfig (mounted as a Secret on the API pod) so
 that in-cluster auth for the control cluster is not disturbed.
@@ -20,7 +20,6 @@ that in-cluster auth for the control cluster is not disturbed.
 import json
 import logging
 import os
-import threading
 from pathlib import Path
 from typing import Optional
 
@@ -55,9 +54,6 @@ _batch_v1: Optional[client.BatchV1Api] = None
 _jobs_core_v1: Optional[client.CoreV1Api] = None
 _control_core_v1: Optional[client.CoreV1Api] = None
 
-_pool_lock = threading.Lock()
-_claimed: dict[str, str] = {}  # session_id -> namespace
-
 
 def _init() -> None:
     global _api_client, _batch_v1, _jobs_core_v1, _control_core_v1
@@ -80,8 +76,6 @@ def _init() -> None:
         config.load_kube_config()
     _control_core_v1 = client.CoreV1Api()
 
-    _rebuild_claims_from_k8s()
-
 
 def _load_pool() -> list[str]:
     """Read the namespace pool from the mounted ConfigMap file.
@@ -103,16 +97,13 @@ def _load_pool() -> list[str]:
     return data
 
 
-def _rebuild_claims_from_k8s() -> None:
-    """Rebuild the in-memory namespace claims from live K8s Jobs."""
-    global _claimed
-    rebuilt: dict[str, str] = {}
+def _get_active_jobs_by_namespace() -> dict[str, list]:
+    """Return {namespace: [active V1Job, ...]} across all pool namespaces."""
+    result: dict[str, list] = {}
     try:
         pool = _load_pool()
     except RuntimeError:
-        logger.warning("Cannot rebuild claims — namespace pool not available yet")
-        return
-
+        return result
     for ns in pool:
         try:
             jobs = _batch_v1.list_namespaced_job(
@@ -120,78 +111,60 @@ def _rebuild_claims_from_k8s() -> None:
             )
         except ApiException:
             continue
+        active = []
         for job in jobs.items:
-            sid = (job.metadata.labels or {}).get("session-id", "")
-            if not sid:
-                continue
             is_done = (
                 (job.status.succeeded and job.status.succeeded > 0)
                 or (job.status.failed and job.status.failed > 0)
             )
             if not is_done:
-                rebuilt[sid] = ns
-
-    with _pool_lock:
-        _claimed = rebuilt
-    logger.info("Rebuilt %d namespace claims from K8s", len(rebuilt))
+                active.append(job)
+        if active:
+            result[ns] = active
+    return result
 
 
 # ---- Namespace pool operations ----
 
 def claim_namespace(session_id: str) -> str:
-    """Claim an available namespace from the pool for a session.
+    """Pick an available namespace from the pool for a session.
 
+    Looks at live K8s Jobs to determine which namespaces are busy.
+    If the session already has an active Job, returns that namespace.
     Raises RuntimeError if the pool is exhausted.
-    Returns the namespace name.
     """
-    with _pool_lock:
-        if session_id in _claimed:
-            return _claimed[session_id]
+    _init()
+    pool = _load_pool()
+    active_by_ns = _get_active_jobs_by_namespace()
 
-        pool = _load_pool()
-        in_use = set(_claimed.values())
-
-        for ns in pool:
-            if ns not in in_use:
-                _claimed[session_id] = ns
-                logger.info("Claimed namespace %s for session %s", ns, session_id)
+    for ns, jobs in active_by_ns.items():
+        for job in jobs:
+            sid = (job.metadata.labels or {}).get("session-id", "")
+            if sid == session_id[:63]:
                 return ns
 
-        raise RuntimeError(
-            f"No available namespaces in pool (pool size={len(pool)}, "
-            f"in-use={len(in_use)}). Wait for a running job to complete."
-        )
+    in_use = set(active_by_ns.keys())
+    for ns in pool:
+        if ns not in in_use:
+            logger.info("Claimed namespace %s for session %s", ns, session_id)
+            return ns
+
+    raise RuntimeError(
+        f"No available namespaces in pool (pool size={len(pool)}, "
+        f"in-use={len(in_use)}). Wait for a running job to complete."
+    )
 
 
 def release_namespace(session_id: str) -> None:
-    """Release a namespace back to the pool after job completion."""
-    with _pool_lock:
-        ns = _claimed.pop(session_id, None)
-        if ns:
-            logger.info("Released namespace %s from session %s", ns, session_id)
+    """No-op — namespace availability is determined by Job state."""
 
 
 def get_namespace_for_session(session_id: str) -> str:
-    """Return the namespace assigned to a session, or empty string if none.
-
-    This may be called from API worker processes that did not create the Job,
-    so in-memory claims can be empty. Fall back to rebuilding and then a direct
-    K8s lookup by session label to avoid callback auth mismatches.
-    """
-    with _pool_lock:
-        ns = _claimed.get(session_id, "")
-    if ns:
-        return ns
-
+    """Return the namespace containing a Job for this session, or empty string."""
     try:
         _init()
     except Exception:
         return ""
-
-    with _pool_lock:
-        ns = _claimed.get(session_id, "")
-    if ns:
-        return ns
 
     try:
         pool = _load_pool()
@@ -207,19 +180,20 @@ def get_namespace_for_session(session_id: str) -> str:
         except ApiException:
             continue
         if jobs.items:
-            with _pool_lock:
-                _claimed[session_id] = ns
             return ns
     return ""
 
 
 def list_active_claims() -> list[dict]:
-    """Return all current namespace claims."""
-    with _pool_lock:
-        return [
-            {"session_id": sid, "namespace": ns}
-            for sid, ns in _claimed.items()
-        ]
+    """Return all namespaces with active (non-finished) Jobs."""
+    _init()
+    active_by_ns = _get_active_jobs_by_namespace()
+    result = []
+    for ns, jobs in active_by_ns.items():
+        for job in jobs:
+            sid = (job.metadata.labels or {}).get("session-id", "")
+            result.append({"session_id": sid, "namespace": ns})
+    return result
 
 
 # ---- Annotation helpers ----
