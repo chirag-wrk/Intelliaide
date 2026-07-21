@@ -1,12 +1,8 @@
 """
-Worker communication abstraction.
+Worker communication — cross-cluster callback mode.
 
-Dispatches between two modes based on the ``COMMS_MODE`` env var:
-
-- ``pvc``      (default) — legacy single-cluster mode; reads/writes the
-  shared PVC filesystem exactly as before.
-- ``callback`` — cross-cluster mode; the worker talks exclusively to the
-  API pod over HTTPS.  No GCS SDK, no cloud credentials beyond Vertex AI.
+The worker talks exclusively to the API pod over HTTPS.
+No GCS SDK, no cloud credentials beyond Vertex AI.
 
 Every public function in this module is a drop-in replacement for the
 corresponding filesystem operation in ``worker.py``.
@@ -26,7 +22,6 @@ import urllib3
 
 logger = logging.getLogger(__name__)
 
-COMMS_MODE: str = os.environ.get("COMMS_MODE", "pvc")
 API_CALLBACK_URL: str = os.environ.get("API_CALLBACK_URL", "").rstrip("/")
 CALLBACK_TOKEN: str = os.environ.get("CALLBACK_TOKEN", "")
 
@@ -38,18 +33,12 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Callback TLS verification defaults to off for cross-cluster OpenShift routes
-# that may present an internal/self-signed chain to worker pods.
 CALLBACK_VERIFY_SSL: bool = _env_bool("CALLBACK_VERIFY_SSL", False)
 if not CALLBACK_VERIFY_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2
-
-
-def _is_callback() -> bool:
-    return COMMS_MODE == "callback"
 
 
 def _headers() -> dict[str, str]:
@@ -138,13 +127,7 @@ def _get(path: str, *, timeout: int = 600,
 # ---------------------------------------------------------------------------
 
 def download_input(session_id: str, local_dir: Path) -> Path:
-    """Download the must-gather archive from the API and return the local path.
-
-    In PVC mode this is a no-op — the archive is already at *local_dir*.
-    """
-    if not _is_callback():
-        return local_dir
-
+    """Download the must-gather archive from the API and return the local path."""
     local_dir.mkdir(parents=True, exist_ok=True)
 
     resp = _get(f"/callback/input/{session_id}", stream=True, timeout=1800)
@@ -168,16 +151,8 @@ def download_input(session_id: str, local_dir: Path) -> Path:
 # Status reporting
 # ---------------------------------------------------------------------------
 
-def report_status(session_id: str, status: dict, job_dir: Path | None = None) -> None:
-    """Report job status.
-
-    In callback mode, POSTs to the API.
-    In PVC mode, writes status.json atomically (preserving sticky fields).
-    """
-    if not _is_callback():
-        _write_status_pvc(job_dir, status)
-        return
-
+def report_status(session_id: str, status: dict) -> None:
+    """Report job status by POSTing to the API."""
     status["session_id"] = session_id
     try:
         _post("/callback/status", json_body=status)
@@ -185,41 +160,15 @@ def report_status(session_id: str, status: dict, job_dir: Path | None = None) ->
         logger.error("Failed to report status for session %s", session_id)
 
 
-def _write_status_pvc(job_dir: Path, status: dict) -> None:
-    """Legacy PVC status write — atomic rename with sticky fields."""
-    from datetime import datetime as _dt
-
-    _STICKY_KEYS = ("owner", "problem_statement", "case_number", "deepening_round")
-    job_dir.mkdir(parents=True, exist_ok=True)
-    final = job_dir / "status.json"
-    if final.exists():
-        try:
-            prev = json.loads(final.read_text(encoding="utf-8"))
-            for key in _STICKY_KEYS:
-                if key not in status and key in prev:
-                    status[key] = prev[key]
-        except Exception:
-            pass
-    status["updated_at"] = _dt.now().isoformat()
-    tmp = job_dir / "status.json.tmp"
-    tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
-    tmp.rename(final)
-
-
 # ---------------------------------------------------------------------------
 # Result upload
 # ---------------------------------------------------------------------------
 
 def upload_results(session_id: str, results_dir: Path) -> None:
-    """Upload analysis results to the API (callback mode only).
+    """Upload analysis results to the API.
 
     Creates a tar archive of results_dir and POSTs it.
-    In PVC mode the orchestrator writes directly to the job results dir
-    (via the ``set_results_dir`` override), so no upload/copy is needed.
     """
-    if not _is_callback():
-        return
-
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for item in results_dir.iterdir():
@@ -240,13 +189,7 @@ def upload_results(session_id: str, results_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def upload_agent_memory(session_id: str, memory_path: Path) -> None:
-    """Upload agent_memory.json to the API (callback mode only).
-
-    In PVC mode the orchestrator writes directly to the job dir
-    (via the ``set_memory_file_path`` override), so no upload is needed.
-    """
-    if not _is_callback():
-        return
+    """Upload agent_memory.json to the API."""
     if not memory_path.exists():
         return
 
@@ -259,14 +202,7 @@ def upload_agent_memory(session_id: str, memory_path: Path) -> None:
 
 
 def download_agent_memory(session_id: str, dest_path: Path) -> None:
-    """Download agent_memory.json from the API (callback mode only).
-
-    In PVC mode the memory file already lives in the job dir
-    (via the ``set_memory_file_path`` override), so no download is needed.
-    """
-    if not _is_callback():
-        return
-
+    """Download agent_memory.json from the API."""
     try:
         resp = _get(f"/callback/agent-memory/{session_id}")
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,7 +231,7 @@ class ConsoleBuffer:
         self._stopped = False
 
     def write(self, text: str) -> None:
-        if not _is_callback() or not text:
+        if not text:
             return
 
         with self._lock:

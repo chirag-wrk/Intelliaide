@@ -2,12 +2,7 @@
 RCA Worker — standalone entrypoint for Kubernetes Job pods.
 
 Reads configuration from environment variables, runs the OrchestratorAgent
-workflow, and writes results + progress back to the API.
-
-Supports two communication modes (env var ``COMMS_MODE``):
-
-- ``pvc``      (default) — single-cluster; reads/writes a shared PVC.
-- ``callback`` — cross-cluster; all I/O goes through the API over HTTPS.
+workflow, and writes results + progress back to the API via HTTPS callbacks.
 
 Environment variables
 ---------------------
@@ -20,10 +15,9 @@ MODE                  "analyze" (default) or "deepening".
 ORCHESTRATOR_SESSION_ID  (deepening only) Internal orchestrator session id.
 FEEDBACK_TEXT            (deepening only) User feedback text.
 
-COMMS_MODE            "pvc" (default) or "callback".
-API_CALLBACK_URL      (callback only) Base URL of the API for callbacks.
-CALLBACK_TOKEN        (callback only) Bearer token for callback auth.
-CALLBACK_VERIFY_SSL   (callback only) "true"/"false" TLS cert verification.
+API_CALLBACK_URL      Base URL of the API for callbacks.
+CALLBACK_TOKEN        Bearer token for callback auth.
+CALLBACK_VERIFY_SSL   "true"/"false" TLS cert verification.
 """
 
 import json
@@ -43,7 +37,7 @@ for p in (_root, _root / "core", _root / "machine_learning"):
     if p_str not in sys.path:
         sys.path.insert(0, p_str)
 
-from orchestrator_agent import OrchestratorAgent, clear_agent_memory, _TeeWriter
+from orchestrator_agent import OrchestratorAgent, clear_agent_memory
 from must_gather_file_selector import MUST_GATHER_DOCS_DIR_DEFAULT
 from app_paths import get_memory_file_path, set_results_dir, set_memory_file_path
 import worker_comms
@@ -58,29 +52,26 @@ _SESSION_ID: str = ""
 
 
 def _write_status(job_dir: Path, status: dict) -> None:
-    """Report job status via the appropriate channel."""
+    """Report job status via HTTPS callback to the API."""
     if "owner" not in status and _OWNER:
         status["owner"] = _OWNER
-    worker_comms.report_status(_SESSION_ID, status, job_dir=job_dir)
+    worker_comms.report_status(_SESSION_ID, status)
 
 
-def _upload_results_callback(results_dir: Path) -> None:
-    """In callback mode, upload results to the API."""
-    if worker_comms.COMMS_MODE == "callback":
-        worker_comms.upload_results(_SESSION_ID, results_dir)
+def _upload_results(results_dir: Path) -> None:
+    """Upload results to the API."""
+    worker_comms.upload_results(_SESSION_ID, results_dir)
 
 
-def _upload_agent_memory_callback() -> None:
-    """In callback mode, upload agent_memory.json to the API."""
-    if worker_comms.COMMS_MODE == "callback":
-        mem_path = get_memory_file_path()
-        worker_comms.upload_agent_memory(_SESSION_ID, mem_path)
+def _upload_agent_memory() -> None:
+    """Upload agent_memory.json to the API."""
+    mem_path = get_memory_file_path()
+    worker_comms.upload_agent_memory(_SESSION_ID, mem_path)
 
 
 def _cleanup_input(job_dir: Path, session_id: str) -> None:
     """Delete the bulky extracted must-gather input/ dir after the last
-    deepening round.  Keeps results/, status.json and agent_memory.json
-    so the session still shows in the Portal jobs board."""
+    deepening round."""
     input_dir = job_dir / "input"
     if input_dir.exists():
         shutil.rmtree(input_dir, ignore_errors=True)
@@ -97,23 +88,18 @@ def _resolve_root(extract_base: Path) -> str:
 
 def _maybe_extract_archive(must_gather_base_dir: str, job_dir: Path,
                            session_id: str) -> str:
-    """If *must_gather_base_dir* points to an archive file, extract it into
-    the job's ``input/`` directory and return the resolved root path.
-    If it's already a directory, return it unchanged.
-
-    In callback mode, downloads the archive from the API first.
-    """
-    if worker_comms.COMMS_MODE == "callback":
-        _write_status(job_dir, {
-            "session_id": session_id,
-            "status": "running",
-            "phase": "downloading",
-            "progress": 1,
-            "message": "Downloading input archive from API...",
-        })
-        input_dir = job_dir / "input"
-        archive_path = worker_comms.download_input(session_id, input_dir)
-        must_gather_base_dir = str(archive_path)
+    """Download the archive from the API, extract it into the job's
+    ``input/`` directory and return the resolved root path."""
+    _write_status(job_dir, {
+        "session_id": session_id,
+        "status": "running",
+        "phase": "downloading",
+        "progress": 1,
+        "message": "Downloading input archive from API...",
+    })
+    input_dir = job_dir / "input"
+    archive_path = worker_comms.download_input(session_id, input_dir)
+    must_gather_base_dir = str(archive_path)
 
     p = Path(must_gather_base_dir)
     if p.is_dir():
@@ -153,7 +139,6 @@ def _maybe_extract_archive(must_gather_base_dir: str, job_dir: Path,
                 cmd = ["tar", "xf", str(p), "-C", str(extract_dir)]
             subprocess.run(cmd, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            # Fallback when tar/pigz flags are unavailable in minimal images.
             print(f"[Worker] CLI extraction failed ({exc}); falling back to Python tarfile")
             with tarfile.open(p, "r:*") as tf:
                 tf.extractall(extract_dir)
@@ -236,8 +221,8 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
         output_session_id=session_id,
     )
 
-    _upload_results_callback(job_results_dir)
-    _upload_agent_memory_callback()
+    _upload_results(job_results_dir)
+    _upload_agent_memory()
 
     orch_status = result.get("status", "error")
     if orch_status != "error":
@@ -261,11 +246,10 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
         })
 
 
-def _restore_agent_memory_callback() -> None:
-    """In callback mode, download agent_memory.json from the API."""
-    if worker_comms.COMMS_MODE == "callback":
-        dest = get_memory_file_path()
-        worker_comms.download_agent_memory(_SESSION_ID, dest)
+def _restore_agent_memory() -> None:
+    """Download agent_memory.json from the API for deepening rounds."""
+    dest = get_memory_file_path()
+    worker_comms.download_agent_memory(_SESSION_ID, dest)
 
 
 def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
@@ -275,7 +259,7 @@ def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
     job_results_dir.mkdir(parents=True, exist_ok=True)
     set_results_dir(job_results_dir)
     set_memory_file_path(job_dir / "agent_memory.json")
-    _restore_agent_memory_callback()
+    _restore_agent_memory()
 
     def progress_callback(event_type, message="", data=None):
         phase_map = {
@@ -330,8 +314,8 @@ def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
         progress_callback=progress_callback,
     )
 
-    _upload_results_callback(job_results_dir)
-    _upload_agent_memory_callback()
+    _upload_results(job_results_dir)
+    _upload_agent_memory()
 
     if isinstance(result, dict) and result.get("status") == "error":
         _write_status(job_dir, {
@@ -357,7 +341,7 @@ def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
             _cleanup_input(job_dir, session_id)
 
 
-class _CallbackTeeWriter:
+class _TeeWriter:
     """Tee stdout to a local log file, the terminal, and the API console buffer."""
 
     def __init__(self, log_file, original_stdout, console_buffer):
@@ -405,11 +389,8 @@ def main() -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "a", encoding="utf-8")
 
-        if worker_comms.COMMS_MODE == "callback":
-            console_buffer = worker_comms.ConsoleBuffer(session_id)
-            sys.stdout = _CallbackTeeWriter(log_file, original_stdout, console_buffer)
-        else:
-            sys.stdout = _TeeWriter(log_file, original_stdout)
+        console_buffer = worker_comms.ConsoleBuffer(session_id)
+        sys.stdout = _TeeWriter(log_file, original_stdout, console_buffer)
     except Exception:
         pass
 
