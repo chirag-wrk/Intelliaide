@@ -1,0 +1,139 @@
+{
+  "pipeline": {
+    "use_chunk_pipeline": null,
+    "file_size_threshold_mb": 50.0
+  },
+  "chunk_settings": {
+    "chunk_size": 10000,
+    "parallel_chunks": true,
+    "chunk_workers": null,
+    "min_chunks_for_parallel": 2
+  },
+  "drain3_settings": {
+    "batch_size": 1000,
+    "similarity_threshold": 0.3,
+    "depth": 4,
+    "max_children": 100
+  },
+  "output": {
+    "output_dir": null,
+    "levels_to_process": [
+      "E",
+      "W",
+      "I",
+      "UNKNOWN"
+    ]
+  },
+  "output_flags": {
+    "include_rare_errors": true,
+    "include_highfreq_errors": true,
+    "include_warnings": true,
+    "include_information": false,
+    "include_unknown": true,
+    "include_config_changes": true
+  },
+  "frequency_settings": {
+    "high_freq_cumulative_threshold": 0.8,
+    "enable_tiered_error_output": true,
+    "rare_absolute_max_size": null,
+    "rare_max_lines_per_template": 15
+  },
+  "preprocessing": {
+    "remove_timestamps": true,
+    "timestamp_patterns": [
+      "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})?\\s*",
+      "^\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s*",
+      "^([IWE])\\d{4}\\s+\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s*",
+      "^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s+\\S+\\s+",
+      "\\b\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\b"
+    ]
+  },
+  "chunk_scaling": {
+    "auto_scale_chunks": true,
+    "tiers": [
+      {
+        "max_mb": 100,
+        "chunk_size": 15000,
+        "parallel": true,
+        "max_workers": 4
+      },
+      {
+        "max_mb": 300,
+        "chunk_size": 40000,
+        "parallel": true,
+        "max_workers": 3
+      },
+      {
+        "max_mb": 600,
+        "chunk_size": 80000,
+        "parallel": true,
+        "max_workers": 2
+      },
+      {
+        "max_mb": 1200,
+        "chunk_size": 150000,
+        "parallel": true,
+        "max_workers": 1
+      }
+    ],
+    "fallback": {
+      "chunk_size": 250000,
+      "parallel": false,
+      "max_workers": null
+    }
+  },
+  "logging": {
+    "verbose": true,
+    "print_progress": true
+  },
+  "_notes": {
+    "pipeline": {
+      "use_chunk_pipeline": "null=auto (based on file size), true=force chunk pipeline, false=force entire file pipeline",
+      "file_size_threshold_mb": "Files larger than this (in MB) use CHUNK pipeline when use_chunk_pipeline is null"
+    },
+    "chunk_settings": {
+      "chunk_size": "Number of lines per chunk for CHUNK pipeline",
+      "parallel_chunks": "true=process chunks in parallel, false=process sequentially",
+      "chunk_workers": "null=auto (based on CPU count), or specify number of parallel workers",
+      "min_chunks_for_parallel": "Minimum number of chunks required to use parallel processing"
+    },
+    "drain3_settings": {
+      "batch_size": "Lines per batch when feeding to Drain3",
+      "similarity_threshold": "Drain3 similarity threshold (0.0-1.0). Lower=more templates, higher=fewer templates",
+      "depth": "Drain3 parse tree depth. Higher=more specific templates",
+      "max_children": "Maximum children per node in Drain3 parse tree"
+    },
+    "output": {
+      "output_dir": "null=use script directory/output, or specify custom path",
+      "levels_to_process": "Log levels to process: E=Error, W=Warning, I=Information, UNKNOWN=Unknown"
+    },
+    "preprocessing": {
+      "remove_timestamps": "true=remove timestamps from log lines before processing",
+      "timestamp_patterns": "Regex patterns for timestamp removal (applied in order)"
+    },
+    "logging": {
+      "verbose": "true=print detailed processing information",
+      "print_progress": "true=print progress during processing"
+    },
+    "output_flags": {
+      "include_rare_errors": "true=generate rare/priority error templates (detailed analysis)",
+      "include_highfreq_errors": "true=generate high-frequency error templates (summary)",
+      "include_warnings": "true=generate warning templates",
+      "include_information": "true=generate information templates",
+      "include_unknown": "true=generate unknown level templates",
+      "include_config_changes": "true=generate configuration change templates"
+    },
+    "frequency_settings": {
+      "high_freq_cumulative_threshold": "Pareto threshold (0.0-1.0). Used as fallback when rare_max_lines_per_template is null",
+      "enable_tiered_error_output": "true=create separate files for high-freq and rare errors",
+      "rare_absolute_max_size": "null=disabled, or integer. Templates with size <= N are always classified as rare",
+      "rare_max_lines_per_template": "Templates with <= this many log lines are rare errors; > this many are high-frequency. Default: 15. Set to null to use Pareto threshold instead"
+    },
+    "chunk_scaling": {
+      "auto_scale_chunks": "true=auto-adjust chunk_size, parallel, and workers based on file size. false=use fixed chunk_settings values",
+      "tiers": "Ordered list of {max_mb, chunk_size, parallel, max_workers}. First tier where file_size <= max_mb wins. Larger chunks = fewer in-memory chunks = less RAM pressure on 16GB pods",
+      "fallback": "Used for files larger than every tier. Sequential with very large chunks to cap memory"
+    },
+    "_output_files": "All output files now include ALL log lines for each template (no sampling or truncation)"
+  }
+}

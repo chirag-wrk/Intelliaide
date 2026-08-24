@@ -1,0 +1,35 @@
+# OpenShift Routes — use INSTEAD of ingress.yaml on OpenShift clusters
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: must-gather-frontend-route
+  namespace: must-gather
+  annotations:
+    haproxy.router.openshift.io/timeout: 1800s
+    haproxy.router.openshift.io/proxy-body-size: 2g
+spec:
+  to:
+    kind: Service
+    name: must-gather-frontend
+  port:
+    targetPort: oauth-proxy
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: must-gather-api-route
+  namespace: must-gather
+  annotations:
+    haproxy.router.openshift.io/timeout: 1800s
+spec:
+  to:
+    kind: Service
+    name: must-gather-api
+  port:
+    targetPort: 8000
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

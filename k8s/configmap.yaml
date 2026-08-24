@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: must-gather-api-config
+  namespace: must-gather
+data:
+  # Verify SSL for outbound HTTPS (set "false" for self-signed certs in internal environments)
+  VERIFY_SSL: "true"

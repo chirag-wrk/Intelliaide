@@ -1,0 +1,17 @@
+---
+description: Update DOC.md when the user types /doc
+alwaysApply: true
+---
+
+# /doc — local change log
+
+When the user message is `/doc` or starts with `/doc `:
+
+1. Open `DOC.md` at the repo root (gitignored).
+2. Append or revise entries for work done in the current session (or topic named after `/doc`).
+3. Use **one line per change** — short, factual, past tense or imperative style.
+4. Group entries under a dated section header if starting a new day or topic.
+5. Update the `Last updated:` line at the top to today's date.
+6. Do not commit `DOC.md`; it is intentionally gitignored.
+
+If `/doc` includes extra text (e.g. `/doc log pipeline`), scope updates to that topic only.

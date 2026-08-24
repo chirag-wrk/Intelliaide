@@ -1,0 +1,44 @@
+{
+  "use_llm_file_selection": true,
+  "file_selection_only": false,
+  "exit_after_analysis": false,
+  "quiet": false,
+  "always_include_kubelet_files": false,
+  "must_gather_docs_dir": "DataSource",
+  "must_gather_base_dir": "",
+  "claude": {
+    "api_key": "",
+    "api_url": "https://api.anthropic.com",
+    "model_id": "claude-sonnet-4@20250514",
+    "max_tokens": 16384,
+    "verify_ssl": true,
+    "endpoint_pattern": "",
+    "custom_gateway": false,
+    "price_per_1m_input_tokens": 3.0,
+    "price_per_1m_output_tokens": 15.0
+  },
+  "agent": {
+    "max_iterations": 25,
+    "max_deepening_rounds": 3
+  },
+  "notes": {
+    "use_llm_file_selection": "Set to true to use LLM to analyze user input and suggest priority files; false to use default YAML list only",
+    "file_selection_only": "Set to true to run only LLM file selection and exit (no data analysis or RCA); false to run full workflow",
+    "exit_after_analysis": "Set to true to exit after YAML and LOG file analysis (no LLM RCA); false to run full workflow including RCA",
+    "always_include_kubelet_files": "Set to true to always add kubelet_service.* and kubelet_journal.* to analysis/RCA; false to use only LLM-suggested files",
+    "quiet": "Set to true to suppress all prints except one: payload sent to LLM and token/cost summary",
+    "must_gather_docs_dir": "Path to must-gather documentation directory (MUST_GATHER_*.md files). Relative paths are resolved from the project root. Default: DataSource",
+    "must_gather_base_dir": "Path to the must-gather root folder containing the actual data (namespaces/, cluster-scoped-resources/, host_service_logs/, etc.). Can be absolute or relative to project root. When provided via API request, it overrides this config value.",
+    "api_key": "Set your API key here, or leave empty to use ANTHROPIC_API_KEY environment variable. For custom gateways (Red Hat, Vertex), use the gateway-issued key.",
+    "api_url": "LLM API endpoint base URL. Default: https://api.anthropic.com. For custom gateways, use the gateway base URL without /v1 path (e.g. https://your-gateway.example.com:443).",
+    "endpoint_pattern": "Full endpoint URL template for custom gateways. Placeholders: {api_url}, {model_id}. Example: '{api_url}/sonnet/models/{model_id}:streamRawPredict'. Leave empty for direct Anthropic API.",
+    "custom_gateway": "Set to true when using a non-Anthropic gateway (Red Hat, Vertex, etc.). When false, uses standard Anthropic /v1/messages endpoint.",
+    "model_id": "Claude model to use (e.g., claude-sonnet-4@20250514, claude-3-5-sonnet-20241022, claude-3-opus-20240229)",
+    "max_tokens": "Maximum tokens for Claude response (default: 16384 for Sonnet 4, 4096 for older models)",
+    "verify_ssl": "Set to false for self-signed certificates in internal environments. Default: true.",
+    "price_per_1m_input_tokens": "USD per 1M input tokens (for cost table display; default 3.0)",
+    "price_per_1m_output_tokens": "USD per 1M output tokens (for cost table display; default 15.0)",
+    "max_iterations": "Maximum number of tool-call iterations for the ReAct agent loop (default: 25)",
+    "max_deepening_rounds": "Maximum deepening rounds HIGH -> MEDIUM -> LOW (default: 3)"
+  }
+}

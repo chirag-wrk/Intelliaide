@@ -1,0 +1,58 @@
+# ── Python ──────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist-py/
+build/
+.venv/
+venv/
+env/
+
+# ── Node / Frontend ────────────────────────────────
+node_modules/
+Frontend/dist/
+Frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# ── Runtime outputs (regenerated every run) ────────
+Version_V1/Results/
+Version_V1/errors_aggregate.json
+Version_V1/Machine-learning/output/
+
+# ── Session state (reset on startup) ───────────────
+Version_V1/Config/agent_memory.json
+
+# ── Secrets & local config ─────────────────────────
+Version_V1/Config/config.json
+.env
+.env.*
+
+# ── Kubernetes / GCP credentials (never commit) ────
+k8s/secret.yaml
+k8s/secret.yml
+k8s/app-secret.yaml
+k8s/app-secret.yml
+**/application_default_credentials.json
+**/*service-account*.json
+**/*service_account*.json
+
+# ── Generated docs ─────────────────────────────────
+*.docx
+DOC.md
+
+# ── OS / editor junk ──────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Nested .git (Version_V1 has its own repo) ─────
+Version_V1/.git/

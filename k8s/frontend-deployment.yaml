@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: must-gather-frontend
+  namespace: must-gather
+  labels:
+    app: must-gather-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: must-gather-frontend
+  template:
+    metadata:
+      labels:
+        app: must-gather-frontend
+    spec:
+      serviceAccountName: must-gather-frontend
+      containers:
+        # OAuth Proxy sidecar — authenticates users via OpenShift OAuth
+        - name: oauth-proxy
+          image: registry.redhat.io/openshift4/ose-oauth-proxy:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --upstream=http://localhost:8080
+            - --https-address=:8443
+            - --provider=openshift
+            - --openshift-service-account=must-gather-frontend
+            - --tls-cert=/etc/tls/private/tls.crt
+            - --tls-key=/etc/tls/private/tls.key
+            - --cookie-secret=UMaZLjukoqbw9hcUkGrYtA==
+            - --cookie-expire=8h0m0s
+            - --email-domain=*
+            - --pass-user-headers=true
+            - --pass-access-token=true
+            - --skip-auth-regex=^/api/health$
+            - --openshift-sar={"namespace":"must-gather","resource":"services","resourceName":"must-gather-frontend","verb":"get"}
+            - --upstream-timeout=1800s
+          ports:
+            - name: oauth-proxy
+              containerPort: 8443
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tls/private
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /oauth/healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /oauth/healthz
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+        # Frontend Nginx — serves static files and proxies /api/ to backend
+        - name: must-gather-frontend
+          image: quay.io/rh-ee-cdate/must-gather-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: tls
+          secret:
+            secretName: must-gather-frontend-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: must-gather-frontend
+  namespace: must-gather
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: must-gather-frontend-tls
+spec:
+  selector:
+    app: must-gather-frontend
+  ports:
+    - name: oauth-proxy
+      port: 8443
+      targetPort: 8443
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP

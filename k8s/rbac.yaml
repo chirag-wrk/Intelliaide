@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: must-gather-api
+  namespace: must-gather
+  labels:
+    app: must-gather-api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: must-gather-frontend
+  namespace: must-gather
+  labels:
+    app: must-gather-frontend
+  annotations:
+    serviceaccounts.openshift.io/oauth-redirectreference.primary: >-
+      {"kind":"OAuthRedirectReference","apiVersion":"v1",
+       "reference":{"kind":"Route","name":"must-gather-frontend-route"}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: job-manager
+  namespace: must-gather
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-job-manager
+  namespace: must-gather
+subjects:
+  - kind: ServiceAccount
+    name: must-gather-api
+    namespace: must-gather
+roleRef:
+  kind: Role
+  name: job-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+# Allow any authenticated OpenShift user to view the frontend service
+# (required for the oauth-proxy --openshift-sar check).
+# Restrict to specific users/groups by editing the subjects below.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rca-portal-users
+  namespace: must-gather
+subjects:
+  - kind: Group
+    name: system:authenticated
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: rca-portal-viewer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rca-portal-viewer
+  namespace: must-gather
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["must-gather-frontend"]
+    verbs: ["get"]

@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom scrollbar for terminal areas */
+.font-mono::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.font-mono::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.font-mono::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 3px;
+}
+
+.font-mono::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Smooth scrolling for terminal panels */
+[class*="overflow-y-auto"] {
+  scroll-behavior: smooth;
+}
+
+/* Prose overrides for RCA report */
+.prose h2 {
+  scroll-margin-top: 80px;
+}
+
+/* Make number inputs not have spinners */
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Selection styling */
+::selection {
+  background-color: rgba(238, 0, 0, 0.2);
+}

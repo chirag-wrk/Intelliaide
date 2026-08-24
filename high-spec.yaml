@@ -1,0 +1,51 @@
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  name: skini-hydra-4m9b4-high-spec
+  namespace: openshift-machine-api
+  labels:
+    machine.openshift.io/cluster-api-cluster: skini-hydra-4m9b4
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: skini-hydra-4m9b4
+      machine.openshift.io/cluster-api-machineset: skini-hydra-4m9b4-high-spec
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: skini-hydra-4m9b4
+        machine.openshift.io/cluster-api-machine-role: worker
+        machine.openshift.io/cluster-api-machine-type: worker
+        machine.openshift.io/cluster-api-machineset: skini-hydra-4m9b4-high-spec
+    spec:
+      providerSpec:
+        value:
+          machineType: n2-highmem-16
+          zone: us-central1-c
+          projectID: openshift-gce-devel
+          region: us-central1
+          kind: GCPMachineProviderSpec
+          apiVersion: machine.openshift.io/v1beta1
+          userDataSecret:
+            name: worker-user-data
+          credentialsSecret:
+            name: gcp-cloud-credentials
+          networkInterfaces:
+            - network: skini-hydra-4m9b4-network
+              subnetwork: skini-hydra-4m9b4-worker-subnet
+          disks:
+            - autoDelete: true
+              boot: true
+              image: projects/rhcos-cloud/global/images/rhcos-9-6-20251212-1-gcp-x86-64
+              sizeGb: 128
+              type: pd-ssd
+          tags:
+            - skini-hydra-4m9b4-worker
+          serviceAccounts:
+            - email: skini-hydra-4m9b4-w@openshift-gce-devel.iam.gserviceaccount.com
+              scopes:
+                - 'https://www.googleapis.com/auth/cloud-platform'
+          canIPForward: false
+          deletionProtection: false
+          shieldedInstanceConfig: {}

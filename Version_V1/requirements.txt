@@ -1,0 +1,48 @@
+# =============================================================================
+# Python Backend Dependencies
+# =============================================================================
+
+# --- Core ---
+requests>=2.31.0
+PyYAML>=6.0.0
+
+# --- LLM / AI ---
+google-auth>=2.20.0
+
+# --- Google Drive (must-gather upload / download) ---
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.1.0
+
+# --- Log & YAML Classification (ML pipeline) ---
+drain3>=0.9.11
+
+# --- ODT Keyfields (critical-field definitions from .odt document) ---
+odfpy>=1.4.1
+
+# --- API Server ---
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# --- Kubernetes Job orchestration ---
+kubernetes>=28.1.0
+
+# --- PDF generation (full-bundle export: charts + layout) ---
+fpdf2>=2.7.0
+matplotlib>=3.8.0
+
+# --- Causal DAG PNG export for Word documents ---
+Pillow>=10.0.0
+
+# --- Word export (RCA bundle .docx with embedded images) ---
+python-docx>=1.1.0
+
+
+# =============================================================================
+# Frontend Dependencies  (managed by npm — see Frontend/package.json)
+# =============================================================================
+# react ^18.3.1           react-dom ^18.3.1
+# react-router-dom ^6.28  react-markdown ^9.0.1
+# recharts ^2.13.3        lucide-react ^0.460.0
+# tailwindcss ^3.4.15     typescript ^5.6.3
+# vite ^6.0.1

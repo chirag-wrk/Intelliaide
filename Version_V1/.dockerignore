@@ -1,0 +1,20 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+*.md
+*.docx
+*.txt
+!requirements.txt
+Experiments_Folder.txt
+LLD_ORCHESTRATOR_TOOLS_PROMPTS.docx
+AGENTIC_FRAMEWORK_DOCUMENTATION.md
+# Large log files — do NOT bake into image
+*_service_*.txt
+current_*.txt
+
+Config/agent_memory.json
+# Injected at runtime via must-gather-app-config Secret; keep GCP project ID and keys out of registry
+Config/config.json
+# Overridden on cluster via must-gather-log-config ConfigMap (see k8s/sync-log-config-configmap.sh)
+# Config/log_config.json

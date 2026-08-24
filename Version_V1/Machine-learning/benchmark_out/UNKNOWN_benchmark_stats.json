@@ -1,0 +1,18 @@
+{
+  "pf_seq": {
+    "elapsed_ms": 9313.708666999446,
+    "total_lines": 646
+  },
+  "pf_par": {
+    "elapsed_ms": 9323.661179998453,
+    "total_lines": 646
+  },
+  "pc_seq": {
+    "elapsed_ms": 9636.642190998828,
+    "total_lines": 646
+  },
+  "pc_par": {
+    "elapsed_ms": 9319.693796001957,
+    "total_lines": 646
+  }
+}
