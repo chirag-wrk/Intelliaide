@@ -8,7 +8,7 @@ metadata:
     pipelinesascode.tekton.dev/cancel-in-progress: "false"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
-      == "main" && ( "Version_V1/***".pathChanged() || ".tekton/intelliaide-api-push.yaml".pathChanged()
+      == "main" && ( "src/api/***".pathChanged() || ".tekton/intelliaide-api-push.yaml".pathChanged()
       )
   labels:
     appstudio.openshift.io/application: intelliaide
@@ -27,7 +27,7 @@ spec:
   - name: dockerfile
     value: Dockerfile
   - name: path-context
-    value: Version_V1
+    value: src/api
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while maintaining trust after pipeline customization.
