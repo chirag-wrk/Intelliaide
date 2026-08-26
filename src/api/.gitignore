@@ -6,13 +6,13 @@ __pycache__/
 # Runtime outputs (regenerated every run)
 Results/
 errors_aggregate.json
-Machine-learning/output/
+machine_learning/output/
 
 # Session state (reset on startup)
-Config/agent_memory.json
+config/agent_memory.json
 
 # Secrets (API keys) — use config.json.template instead
-Config/config.json
+config/config.json
 
 # Generated docs (optional — keep .md source instead)
 *.docx

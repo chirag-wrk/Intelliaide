@@ -2,7 +2,7 @@
 LLM RCA Agent
 
 Uses Claude LLM to aggregate, summarize, and perform root cause analysis (RCA)
-on YAML analysis data returned by ML_YAML_CLASSIFICATION (Error-classified objects only).
+on YAML analysis data returned by ml_yaml_classification (Error-classified objects only).
 Sends only YAML objects to the LLM (line numbers removed).
 """
 

@@ -24,7 +24,7 @@ def _is_quiet():
 
 def _import_ml_module(module_name: str, symbol: str):
     """
-    Import a symbol from a Machine-learning module, handling both .py and .PY
+    Import a symbol from a machine_learning module, handling both .py and .PY
     extensions (Linux is case-sensitive so .PY is invisible to normal import).
     """
     # 1. Try normal import first (works if .py exists on sys.path)
@@ -34,8 +34,8 @@ def _import_ml_module(module_name: str, symbol: str):
     except (ImportError, AttributeError):
         pass
 
-    # 2. Locate the .PY or .py file manually in Machine-learning/
-    ml_dir = Path(__file__).resolve().parent.parent / "Machine-learning"
+    # 2. Locate the .PY or .py file manually in machine_learning/
+    ml_dir = Path(__file__).resolve().parent.parent / "machine_learning"
     for ext in (".py", ".PY"):
         candidate = ml_dir / f"{module_name}{ext}"
         if candidate.is_file():
@@ -50,21 +50,21 @@ def _import_ml_module(module_name: str, symbol: str):
 
 
 try:
-    classify_critical_fields = _import_ml_module("ML_YAML_CLASSIFICATION", "classify_critical_fields")
+    classify_critical_fields = _import_ml_module("ml_yaml_classification", "classify_critical_fields")
     ML_CLASSIFIER_AVAILABLE = True
 except (ImportError, Exception) as e:
     ML_CLASSIFIER_AVAILABLE = False
     if not _is_quiet():
-        print(f"[Data Analyzer] ML_YAML_CLASSIFICATION not available: {e}")
+        print(f"[Data Analyzer] ml_yaml_classification not available: {e}")
 
 try:
     # analyze_logs is the public entry point (validates inputs, checks drain3, loads config)
-    analyze_logs_ml = _import_ml_module("ML_LOG_CLASSIFICATION", "analyze_logs")
+    analyze_logs_ml = _import_ml_module("ml_log_classification", "analyze_logs")
     ML_LOG_CLASSIFICATION_AVAILABLE = True
 except (ImportError, Exception) as e:
     ML_LOG_CLASSIFICATION_AVAILABLE = False
     if not _is_quiet():
-        print(f"[Data Analyzer] ML_LOG_CLASSIFICATION not available: {e}")
+        print(f"[Data Analyzer] ml_log_classification not available: {e}")
 
 try:
     from odf.opendocument import load as load_odt
@@ -2074,7 +2074,7 @@ class DataAnalyzer:
                     # Print file name so user knows which file the table is for
                     self.print_classification_table(metadata['classification_table'], file_key)
 
-        # Process log/txt files with ML_LOG_CLASSIFICATION (Error, Information, Warning)
+        # Process log/txt files with ml_log_classification (Error, Information, Warning)
         # analyze_logs_ml is the public entry point: takes a single file_path, returns
         # {"status", "files": {"rare_errors": {path, templates, lines}, ...}, "totals", ...}
         log_processing_result = {}
@@ -2152,7 +2152,7 @@ class DataAnalyzer:
                         pass
         elif log_files and not ML_LOG_CLASSIFICATION_AVAILABLE:
             if not _is_quiet():
-                print("[Data Analyzer] Log files present but ML_LOG_CLASSIFICATION not available (install drain3).")
+                print("[Data Analyzer] Log files present but ml_log_classification not available (install drain3).")
             if progress_callback:
                 try:
                     progress_callback("log_processing_result", "Log processing skipped (drain3 not installed)", {"error": "drain3 not installed", "summary": {}, "saved_files": {}})

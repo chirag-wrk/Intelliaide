@@ -116,7 +116,7 @@ def _resolve_must_gather_docs_dir() -> str:
     except ImportError:
         pass
 
-    # 3. Fallback: DataSource is one level up from Main-program/
+    # 3. Fallback: data_source is one level up from core/
     return os.path.join(_project_root, "DataSource")
 
 MUST_GATHER_DOCS_DIR_DEFAULT = _resolve_must_gather_docs_dir()

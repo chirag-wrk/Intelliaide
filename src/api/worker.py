@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 _root = Path(__file__).resolve().parent
-for p in (_root, _root / "Main-program", _root / "Machine-learning"):
+for p in (_root, _root / "core", _root / "machine_learning"):
     p_str = str(p)
     if p_str not in sys.path:
         sys.path.insert(0, p_str)

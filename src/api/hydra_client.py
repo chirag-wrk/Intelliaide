@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Red Hat case attachments: list and download.
-MODIFIED: Added command-line arguments and streaming for 40GB downloads.
+Red Hat Hydra API Client
+
+A command-line client for listing and downloading Red Hat case attachments
+via the Hydra REST API. Supports streaming downloads for large files.
 
 Usage (Automated):
-  python3 script.py <CASE_ID> <ATTACH_NUM> <FILENAME>
+  python3 hydra_client.py <CASE_ID> <ATTACH_NUM> <FILENAME>
 Usage (Interactive):
-  python3 script.py <CASE_ID>
+  python3 hydra_client.py <CASE_ID>
 """
 
 import json
@@ -95,7 +97,7 @@ def _attachment_uuid(item):
 def main():
     case_number = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
     if not case_number:
-        print("Usage: python script.py <CASE_NUMBER> [ATTACH_NUM] [FILENAME]")
+        print("Usage: python hydra_client.py <CASE_NUMBER> [ATTACH_NUM] [FILENAME]")
         sys.exit(1)
 
     token_response = _fetch_sso_token(CLIENT_ID, CLIENT_SECRET)

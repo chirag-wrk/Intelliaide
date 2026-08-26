@@ -13,8 +13,8 @@ AGENTIC_FRAMEWORK_DOCUMENTATION.md
 *_service_*.txt
 current_*.txt
 
-Config/agent_memory.json
+config/agent_memory.json
 # Injected at runtime via must-gather-app-config Secret; keep GCP project ID and keys out of registry
-Config/config.json
+config/config.json
 # Overridden on cluster via must-gather-log-config ConfigMap (see k8s/sync-log-config-configmap.sh)
-# Config/log_config.json
+# config/log_config.json

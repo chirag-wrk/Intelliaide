@@ -15,10 +15,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api.py app_paths.py worker.py job_runner.py ./
-COPY Main-program/ ./Main-program/
-COPY Machine-learning/ ./Machine-learning/
-COPY Config/ ./Config/
-COPY DataSource/ ./DataSource/
+COPY core/ ./core/
+COPY machine_learning/ ./machine_learning/
+COPY config/ ./config/
+COPY data_source/ ./data_source/
 COPY utils/ ./utils/
 
 ENV MUST_GATHER_EXTRACT_DIR=/tmp/must-gather
