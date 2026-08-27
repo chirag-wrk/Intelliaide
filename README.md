@@ -6,7 +6,7 @@ https://gitlab.cee.redhat.com/intelliaide-debug/intelliaide-intermediate-deliver
 This repo contains:
 
 - **API** (`src/api/`): a FastAPI service that runs the must-gather analysis / RCA workflow.
-- **UI** (`Frontend/`): a React (Vite) dashboard served by nginx, which **reverse-proxies** `/api/*` to the API Service.
+- **UI** (`frontend/`): a React (Vite) dashboard served by nginx, which **reverse-proxies** `/api/*` to the API Service.
 - **Manifests** (`k8s/`): OpenShift-ready Kubernetes YAML (Namespace, ConfigMap, Deployments, Services, Routes).
 
 The LLM calls have been updated to use **Claude via GCP Vertex AI** (token auth via Application Default Credentials).
@@ -43,7 +43,7 @@ podman push quay.io/rh-ee-cdate/must-gather-api:latest
 Frontend image:
 
 ```bash
-podman build -t quay.io/rh-ee-cdate/must-gather-frontend:latest Frontend
+podman build -t quay.io/rh-ee-cdate/must-gather-frontend:latest frontend
 podman push quay.io/rh-ee-cdate/must-gather-frontend:latest
 ```
 

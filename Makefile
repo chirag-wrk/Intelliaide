@@ -1,4 +1,5 @@
-.PHONY: help install install-dev lint format test clean build
+.PHONY: help install install-dev lint format test clean build \
+       frontend-install frontend-dev frontend-build
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -49,8 +50,20 @@ run-worker: ## Run the worker
 run-hydra: ## Run the Hydra client (usage: make run-hydra ARGS="case_number")
 	cd src && python -m api.hydra_client $(ARGS)
 
-image-build: ## Build Docker image for api
-	podman build -t intelliaide:latest -f src/api/Dockerfile src/api/
+frontend-install: ## Install frontend dependencies
+	cd frontend && npm install
 
-image-run: ## Run Docker container for api
-	podman run -p 8000:8000 intelliaide:latest
+frontend-dev: ## Run frontend dev server
+	cd frontend && npm run dev
+
+frontend-build: ## Build frontend for production
+	cd frontend && npm run build
+
+image-api: ## Build Docker image for api
+	podman build -t intelliaide-api:latest -f src/api/Dockerfile src/api/
+
+image-frontend: ## Build Docker image for frontend
+	podman build -t intelliaide-frontend:latest frontend/
+
+image-run-api: ## Run API Docker container
+	podman run -p 8000:8000 intelliaide-api:latest
