@@ -50,7 +50,7 @@ def _import_ml_module(module_name: str, symbol: str):
 
 
 try:
-    classify_critical_fields = _import_ml_module("ml_yaml_classification", "classify_critical_fields")
+    analyze_yaml_files = _import_ml_module("ml_yaml_classification", "analyze_yaml_files")
     ML_CLASSIFIER_AVAILABLE = True
 except (ImportError, Exception) as e:
     ML_CLASSIFIER_AVAILABLE = False
@@ -1525,7 +1525,7 @@ class DataAnalyzer:
 
             # Step 4: Send to ML Classifier
             if ML_CLASSIFIER_AVAILABLE and critical_fields_list:
-                ml_response = classify_critical_fields(critical_fields_list)
+                ml_response = analyze_yaml_files(critical_fields_list)
 
                 # Handle both structured (dict) and legacy (list) returns
                 if isinstance(ml_response, dict):

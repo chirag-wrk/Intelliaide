@@ -1125,7 +1125,7 @@ def get_classification_reason(
         return f"Medium frequency ({frequency:.2%})"
 
 
-def classify_critical_fields(critical_fields_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+def analyze_yaml_files(critical_fields_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Main function to classify objects based on their critical fields.
     
