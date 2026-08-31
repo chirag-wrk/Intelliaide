@@ -45,7 +45,6 @@ WORKER_MEM_REQUEST: str = os.environ.get("WORKER_MEM_REQUEST", "1Gi")
 WORKER_MEM_LIMIT: str = os.environ.get("WORKER_MEM_LIMIT", "2Gi")
 
 JOB_ACTIVE_DEADLINE: int = int(os.environ.get("JOB_ACTIVE_DEADLINE_SECONDS", "3600"))
-JOB_TTL_AFTER_FINISHED: int = int(os.environ.get("JOB_TTL_AFTER_FINISHED", "600"))
 
 ANNOTATION_PREFIX = "rca.intelliaide"
 
@@ -415,7 +414,6 @@ def create_remote_job(
             ),
             backoff_limit=0,
             active_deadline_seconds=JOB_ACTIVE_DEADLINE,
-            ttl_seconds_after_finished=JOB_TTL_AFTER_FINISHED,
         ),
     )
 
