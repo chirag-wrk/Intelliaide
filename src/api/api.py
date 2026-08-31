@@ -1886,7 +1886,7 @@ async def callback_post_status(request: Request):
 
     if body.get("status") in ("completed", "error"):
         import asyncio
-        asyncio.get_event_loop().call_later(
+        asyncio.get_running_loop().call_later(
             30, lambda: _schedule_remote_cleanup(session_id)
         )
 
