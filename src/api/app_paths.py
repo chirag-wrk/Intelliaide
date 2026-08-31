@@ -1,9 +1,9 @@
 """
 Application paths for normal run vs PyInstaller frozen exe.
-Layout: DataSource/, Config/, Machine-learning/, Main-program/, Chatbot/, Results/
+Layout: data_source/, config/, machine_learning/, core/, Chatbot/, Results/
 - When frozen: APPLICATION_DIR = folder containing the .exe.
 - Config: config.json, json_config.json, agent_memory.json
-- DataSource: keyfields_yaml_ml_input.docx, keyfields_json_ml_input.odt, MUST_GATHER_*.md
+- data_source: keyfields_yaml_ml_input.docx, keyfields_json_ml_input.odt, MUST_GATHER_*.md
 - Results: errors_aggregate.json, rca_summary.txt, ML output files
 """
 
@@ -27,10 +27,10 @@ def get_resource_dir() -> Path:
 
 def get_config_dir() -> Path:
     """Config directory (config.json, agent_memory.json)."""
-    return get_application_dir() / "Config"
+    return get_application_dir() / "config"
 
 def get_config_path() -> Path:
-    """Config file: Config/config.json (or bundled)."""
+    """Config file: config/config.json (or bundled)."""
     app = get_application_dir()
     cfg_dir = get_config_dir()
     res = get_resource_dir()
@@ -41,31 +41,31 @@ def get_config_path() -> Path:
     return cfg_dir / "config.json"
 
 def get_data_source_dir() -> Path:
-    """DataSource directory (keyfields, MUST_GATHER docs)."""
-    return get_application_dir() / "DataSource"
+    """data_source directory (keyfields, MUST_GATHER docs)."""
+    return get_application_dir() / "data_source"
 
 def get_keyfields_path() -> Path:
-    """Path to keyfields_yaml_ml_input.docx (DataSource or bundled)."""
+    """Path to keyfields_yaml_ml_input.docx (data_source or bundled)."""
     app_ds = get_data_source_dir() / "keyfields_yaml_ml_input.docx"
     if app_ds.exists():
         return app_ds
-    res_ds = get_resource_dir() / "DataSource" / "keyfields_yaml_ml_input.docx"
+    res_ds = get_resource_dir() / "data_source" / "keyfields_yaml_ml_input.docx"
     if res_ds.exists():
         return res_ds
     return get_resource_dir() / "keyfields_yaml_ml_input.docx"
 
 def get_json_keyfields_path() -> Path:
-    """Path to keyfields_json_ml_input.odt (DataSource or bundled)."""
+    """Path to keyfields_json_ml_input.odt (data_source or bundled)."""
     app_ds = get_data_source_dir() / "keyfields_json_ml_input.odt"
     if app_ds.exists():
         return app_ds
-    res_ds = get_resource_dir() / "DataSource" / "keyfields_json_ml_input.odt"
+    res_ds = get_resource_dir() / "data_source" / "keyfields_json_ml_input.odt"
     if res_ds.exists():
         return res_ds
     return get_resource_dir() / "keyfields_json_ml_input.odt"
 
 def get_json_config_path() -> Path:
-    """JSON processing config: Config/json_config.json (or bundled)."""
+    """JSON processing config: config/json_config.json (or bundled)."""
     cfg_dir = get_config_dir()
     res = get_resource_dir()
     for d in (cfg_dir, get_application_dir(), res, res / "Config"):
@@ -75,7 +75,7 @@ def get_json_config_path() -> Path:
     return cfg_dir / "json_config.json"
 
 def get_log_config_path() -> Path:
-    """Log ML pipeline config: Config/log_config.json (or bundled)."""
+    """Log ML pipeline config: config/log_config.json (or bundled)."""
     cfg_dir = get_config_dir()
     res = get_resource_dir()
     for d in (cfg_dir, get_application_dir(), res, res / "Config"):
@@ -85,11 +85,11 @@ def get_log_config_path() -> Path:
     return cfg_dir / "log_config.json"
 
 def get_memory_file_path() -> Path:
-    """Agent memory file: Config/agent_memory.json."""
+    """Agent memory file: config/agent_memory.json."""
     return get_config_dir() / "agent_memory.json"
 
 def get_must_gather_docs_dir() -> Path:
-    """MUST_GATHER topology docs: DataSource (MUST_GATHER_*.md)."""
+    """MUST_GATHER topology docs: data_source (MUST_GATHER_*.md)."""
     return get_data_source_dir()
 
 def get_results_dir() -> Path:

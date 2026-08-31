@@ -18,9 +18,9 @@ import sys
 import atexit
 from pathlib import Path
 
-# Project root and paths so Main-program and Machine-learning modules are importable
+# Project root and paths so core and machine_learning modules are importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-for p in (PROJECT_ROOT, PROJECT_ROOT / "Main-program", PROJECT_ROOT / "Machine-learning"):
+for p in (PROJECT_ROOT, PROJECT_ROOT / "core", PROJECT_ROOT / "machine_learning"):
     p_str = str(p)
     if p_str not in sys.path:
         sys.path.insert(0, p_str)

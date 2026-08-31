@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include src/api/requirements.txt
+recursive-include src/api/config *.json *.yaml
+recursive-include src/api/data_source *.md *.odt
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]

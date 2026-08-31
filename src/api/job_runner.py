@@ -442,10 +442,10 @@ def _create_job(
         client.V1VolumeMount(name="shared-data", mount_path=SHARED_PVC_MOUNT),
         client.V1VolumeMount(name="gcloud-adc", mount_path="/secrets/gcloud", read_only=True),
         client.V1VolumeMount(name="app-config-secret",
-                             mount_path="/app/Config/config.json",
+                             mount_path="/app/config/config.json",
                              sub_path="config.json", read_only=True),
         client.V1VolumeMount(name="log-config",
-                             mount_path="/app/Config/log_config.json",
+                             mount_path="/app/config/log_config.json",
                              sub_path="log_config.json", read_only=True),
     ]
 

@@ -243,7 +243,7 @@ def load_config(config_path: Optional[str] = None) -> PipelineConfig:
     if config_path:
         search_paths.append(Path(config_path))
 
-    # Application Config/ (Docker: /app/Config/log_config.json; k8s ConfigMap mount)
+    # Application config/ (Docker: /app/config/log_config.json; k8s ConfigMap mount)
     try:
         from app_paths import get_log_config_path
         search_paths.append(get_log_config_path())
@@ -254,7 +254,7 @@ def load_config(config_path: Optional[str] = None) -> PipelineConfig:
     # Current working directory
     search_paths.append(Path.cwd() / CONFIG_FILE_NAME)
     
-    # Script directory (Machine-learning/)
+    # Script directory (machine_learning/)
     search_paths.append(Path(__file__).parent / CONFIG_FILE_NAME)
     
     for path in search_paths:

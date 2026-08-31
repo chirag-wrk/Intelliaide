@@ -44,14 +44,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Import shared primitives from ML_LOG_CLASSIFICATION
+# Import shared primitives from ml_log_classification
 # ---------------------------------------------------------------------------
 _ML_DIR = Path(__file__).resolve().parent
 if str(_ML_DIR) not in sys.path:
     sys.path.insert(0, str(_ML_DIR))
 
 try:
-    from ML_LOG_CLASSIFICATION import (
+    from ml_log_classification import (
         get_config,
         create_drain3_miner,
         extract_drain3_results,
@@ -67,7 +67,7 @@ try:
         DRAIN3_AVAILABLE,
     )
 except ImportError as e:
-    print(f"[ERROR] Cannot import from ML_LOG_CLASSIFICATION.py: {e}")
+    print(f"[ERROR] Cannot import from ml_log_classification.py: {e}")
     sys.exit(1)
 
 if not DRAIN3_AVAILABLE:
@@ -225,7 +225,7 @@ def _file_level_worker_pf(args: Tuple) -> Dict:
     _dir = Path(__file__).resolve().parent
     if str(_dir) not in sys.path:
         sys.path.insert(0, str(_dir))
-    from ML_LOG_CLASSIFICATION import (
+    from ml_log_classification import (
         process_lines_with_drain3, build_cluster_to_lines,
         classify_templates_for_level, classify_templates_by_frequency,
         PipelineConfig, Drain3Config,
@@ -261,7 +261,7 @@ def _file_level_worker_pc(args: Tuple) -> Dict:
     _dir = Path(__file__).resolve().parent
     if str(_dir) not in sys.path:
         sys.path.insert(0, str(_dir))
-    from ML_LOG_CLASSIFICATION import (
+    from ml_log_classification import (
         process_lines_with_drain3, build_cluster_to_lines,
         classify_templates_for_level, classify_templates_by_frequency,
         PipelineConfig, Drain3Config,

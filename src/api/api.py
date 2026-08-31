@@ -35,7 +35,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 _root = Path(__file__).resolve().parent
-for p in (_root, _root / "Main-program", _root / "Machine-learning"):
+for p in (_root, _root / "core", _root / "machine_learning"):
     p_str = str(p)
     if p_str not in sys.path:
         sys.path.insert(0, p_str)
@@ -139,7 +139,7 @@ _MG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# ── Hydra REST API constants (from Hydra-Access-download.py) ─────────────
+# ── Hydra REST API constants (from hydra_client.py) ─────────────
 _HYDRA_BASE_URL = "https://access.redhat.com/hydra/rest/cases"
 _HYDRA_DL_BASE  = "https://attachments.access.redhat.com/hydra/rest/cases"
 _HYDRA_SSO_URL  = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"

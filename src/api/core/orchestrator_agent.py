@@ -26,12 +26,12 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 from enum import Enum
 
-# Add project root and Machine-learning dir to sys.path so that
-# app_paths, ML modules, etc. are importable from Main-program/
+# Add project root and machine_learning dir to sys.path so that
+# app_paths, ML modules, etc. are importable from core/
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
-_ml_dir = os.path.join(_project_root, "Machine-learning")
+_ml_dir = os.path.join(_project_root, "machine_learning")
 if _ml_dir not in sys.path:
     sys.path.insert(0, _ml_dir)
 

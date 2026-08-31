@@ -9,7 +9,7 @@ metadata:
     pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && target_branch
-      == "main" && ( "Frontend/***".pathChanged() || ".tekton/intelliaide-frontend-pull-request.yaml".pathChanged()
+      == "main" && ( "frontend/***".pathChanged() || ".tekton/intelliaide-frontend-pull-request.yaml".pathChanged()
       )
   labels:
     appstudio.openshift.io/application: intelliaide
@@ -30,7 +30,7 @@ spec:
   - name: dockerfile
     value: Dockerfile
   - name: path-context
-    value: Frontend
+    value: frontend
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while reducing network traffic.
