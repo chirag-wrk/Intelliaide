@@ -903,12 +903,9 @@ def get_rca_dag(stage: str, session_id: str | None = Query(default=None), sessio
     dag_filename = filename.replace(".txt", "_dag.json")
     sid = _resolve_session_id(session_id or session)
     if sid:
-        dag_path = _job_results_dir(sid) / dag_filename
-        if dag_path.exists():
-            try:
-                return JSONResponse(content=json.loads(dag_path.read_text(encoding="utf-8")))
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to read {dag_filename}: {e}")
+        dag = object_storage.read_json(sid, f"results/{dag_filename}")
+        if dag is not None:
+            return JSONResponse(content=dag)
 
     return PlainTextResponse("", status_code=204)
 
@@ -932,16 +929,16 @@ _RCA_STAGE_FILES = [
 ]
 
 
-def _load_stage_dag_png(results_dir: Path, disk_name: str) -> bytes | None:
+def _load_stage_dag_png(session_id: str, disk_name: str) -> bytes | None:
     """Render the causal-DAG PNG for an RCA stage text file, if JSON exists."""
-    dag_path = results_dir / disk_name.replace(".txt", "_dag.json")
-    if not (dag_path.is_file() and dag_path.stat().st_size > 0):
-        return None
+    dag_filename = disk_name.replace(".txt", "_dag.json")
     try:
-        dag = json.loads(dag_path.read_text(encoding="utf-8"))
+        dag = object_storage.read_json(session_id, f"results/{dag_filename}")
+        if dag is None:
+            return None
         return render_causal_dag_png(dag)
     except Exception as exc:
-        logger.warning("Skipping causal DAG embed for %s: %s", dag_path.name, exc)
+        logger.warning("Skipping causal DAG embed for %s: %s", dag_filename, exc)
         return None
 
 
@@ -1004,7 +1001,7 @@ def get_rca_bundle_zip(session_id: str | None = Query(default=None), session: st
         if not text or not text.strip():
             continue
         title = arc_name.rsplit(".", 1)[0].replace("_", " ")
-        dag_png = _load_stage_dag_png(results_dir, disk_name)
+        dag_png = _load_stage_dag_png(sid, disk_name)
         append_rca_stage_bundle_entries(
             doc_entries,
             arc_prefix="",
@@ -1689,7 +1686,7 @@ def download_full_bundle_zip(session_id: str | None = Query(default=None), sessi
         if not text or not text.strip():
             continue
         title = arc_name.rsplit(".", 1)[0].replace("_", " ")
-        dag_png = _load_stage_dag_png(results_dir, disk_name)
+        dag_png = _load_stage_dag_png(sid, disk_name)
         append_rca_stage_bundle_entries(
             doc_entries,
             arc_prefix="rca_report_bundle/",
