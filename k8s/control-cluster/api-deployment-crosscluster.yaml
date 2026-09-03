@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: must-gather-api
+  namespace: must-gather
+  labels:
+    app: must-gather-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: must-gather-api
+  template:
+    metadata:
+      labels:
+        app: must-gather-api
+    spec:
+      serviceAccountName: must-gather-api
+      containers:
+        - name: must-gather-api
+          image: quay.io/rh-ee-cdate/must-gather-api-spatidar:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: must-gather-api-config
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /secrets/gcloud/application_default_credentials.json
+            - name: CLOUDSDK_CONFIG
+              value: /tmp/gcloud
+            - name: HOME
+              value: /tmp
+            - name: WORKER_IMAGE
+              value: quay.io/rh-ee-cdate/must-gather-api-spatidar:latest
+            - name: K8S_NAMESPACE
+              value: must-gather
+            - name: GCP_SECRET_NAME
+              value: gcloud-adc-secret
+            - name: APP_CONFIG_SECRET_NAME
+              value: must-gather-app-config
+            - name: ADMIN_USERS
+              value: "kubeadmin,kube:admin"
+            # Cross-cluster mode
+            - name: JOBS_CLUSTER_MODE
+              value: "enabled"
+            - name: JOBS_CLUSTER_KUBECONFIG
+              value: /secrets/jobs-cluster/kubeconfig
+            - name: API_CALLBACK_URL
+              value: "https://must-gather-api-route-must-gather.apps.<CONTROL_CLUSTER_DOMAIN>"
+            - name: GCS_BUCKET_NAME
+              value: "rca-inputs"
+            - name: LOCAL_SESSION_DIR
+              value: /data/sessions
+            - name: NAMESPACE_POOL_FILE
+              value: /config/namespace-pool/namespaces.json
+          volumeMounts:
+            - name: gcloud-adc
+              mountPath: /secrets/gcloud
+              readOnly: true
+            - name: local-data
+              mountPath: /data/sessions
+            - name: must-gather-data
+              mountPath: /data/must-gather
+            - name: app-config-secret
+              mountPath: /app/Config/config.json
+              subPath: config.json
+              readOnly: true
+            - name: jobs-cluster-kubeconfig
+              mountPath: /secrets/jobs-cluster
+              readOnly: true
+            - name: namespace-pool
+              mountPath: /config/namespace-pool
+              readOnly: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: gcloud-adc
+          secret:
+            secretName: gcloud-adc-secret
+        - name: local-data
+          persistentVolumeClaim:
+            claimName: api-local-storage
+        - name: must-gather-data
+          emptyDir: {}
+        - name: app-config-secret
+          secret:
+            secretName: must-gather-app-config
+        - name: jobs-cluster-kubeconfig
+          secret:
+            secretName: jobs-cluster-kubeconfig
+        - name: namespace-pool
+          configMap:
+            name: namespace-pool
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: must-gather-api
+  namespace: must-gather
+spec:
+  selector:
+    app: must-gather-api
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP

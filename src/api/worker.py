@@ -2,21 +2,22 @@
 RCA Worker — standalone entrypoint for Kubernetes Job pods.
 
 Reads configuration from environment variables, runs the OrchestratorAgent
-workflow, and writes results + progress to a shared PVC directory so the
-API pod can relay status to the frontend.
+workflow, and writes results + progress back to the API via HTTPS callbacks.
 
 Environment variables
 ---------------------
 SESSION_ID            Unique session identifier (set by the API).
 USER_QUERY            Problem statement / user query.
-JOB_DIR               Per-job directory on the shared PVC
-                      (e.g. /shared/jobs/<session_id>).
-MUST_GATHER_BASE_DIR  Resolved path to the must-gather root folder
-                      inside JOB_DIR/input/.
+JOB_DIR               Per-job working directory.
+MUST_GATHER_BASE_DIR  Resolved path to the must-gather root folder.
 
 MODE                  "analyze" (default) or "deepening".
 ORCHESTRATOR_SESSION_ID  (deepening only) Internal orchestrator session id.
 FEEDBACK_TEXT            (deepening only) User feedback text.
+
+API_CALLBACK_URL      Base URL of the API for callbacks.
+CALLBACK_TOKEN        Bearer token for callback auth.
+CALLBACK_VERIFY_SSL   "true"/"false" TLS cert verification.
 """
 
 import json
@@ -24,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from datetime import datetime
@@ -35,9 +37,10 @@ for p in (_root, _root / "core", _root / "machine_learning"):
     if p_str not in sys.path:
         sys.path.insert(0, p_str)
 
-from orchestrator_agent import OrchestratorAgent, clear_agent_memory, _TeeWriter
+from orchestrator_agent import OrchestratorAgent, clear_agent_memory
 from must_gather_file_selector import MUST_GATHER_DOCS_DIR_DEFAULT
-from app_paths import get_results_dir, get_memory_file_path
+from app_paths import get_memory_file_path, set_results_dir, set_memory_file_path
+import worker_comms
 
 
 def _read_env(name: str, default: str = "") -> str:
@@ -45,58 +48,30 @@ def _read_env(name: str, default: str = "") -> str:
 
 
 _OWNER: str = ""
+_SESSION_ID: str = ""
 
 
 def _write_status(job_dir: Path, status: dict) -> None:
-    """Atomically write status.json (write tmp then rename).
-
-    Automatically preserves the ``owner``, ``problem_statement``, and
-    ``case_number`` fields so callers don't have to pass them every time.
-    """
-    final = job_dir / "status.json"
-    if final.exists():
-        try:
-            prev = json.loads(final.read_text(encoding="utf-8"))
-            for keep_key in ("owner", "problem_statement", "case_number", "deepening_round"):
-                if keep_key not in status and keep_key in prev:
-                    status[keep_key] = prev[keep_key]
-        except Exception:
-            pass
+    """Report job status via HTTPS callback to the API."""
     if "owner" not in status and _OWNER:
         status["owner"] = _OWNER
-    status["updated_at"] = datetime.now().isoformat()
-    tmp = job_dir / "status.json.tmp"
-    tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
-    tmp.rename(final)
+    worker_comms.report_status(_SESSION_ID, status)
 
 
-def _copy_results_to_job(results_dir: Path, job_results_dir: Path) -> None:
-    """Copy all result files from the app's Results/ dir into the job's
-    results directory on the shared PVC."""
-    job_results_dir.mkdir(parents=True, exist_ok=True)
-    for item in results_dir.iterdir():
-        dest = job_results_dir / item.name
-        if item.is_file():
-            shutil.copy2(item, dest)
-        elif item.is_dir():
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(item, dest)
+def _upload_results(results_dir: Path) -> None:
+    """Upload results to the API."""
+    worker_comms.upload_results(_SESSION_ID, results_dir)
 
 
-def _copy_agent_memory_to_job(job_dir: Path) -> None:
-    """Copy Config/agent_memory.json to the job directory on the shared PVC
-    so the API pod can restore it for feedback/deepening rounds."""
+def _upload_agent_memory() -> None:
+    """Upload agent_memory.json to the API."""
     mem_path = get_memory_file_path()
-    if mem_path.exists():
-        dest = job_dir / "agent_memory.json"
-        shutil.copy2(mem_path, dest)
+    worker_comms.upload_agent_memory(_SESSION_ID, mem_path)
 
 
 def _cleanup_input(job_dir: Path, session_id: str) -> None:
     """Delete the bulky extracted must-gather input/ dir after the last
-    deepening round.  Keeps results/, status.json and agent_memory.json
-    so the session still shows in the Portal jobs board."""
+    deepening round."""
     input_dir = job_dir / "input"
     if input_dir.exists():
         shutil.rmtree(input_dir, ignore_errors=True)
@@ -113,9 +88,19 @@ def _resolve_root(extract_base: Path) -> str:
 
 def _maybe_extract_archive(must_gather_base_dir: str, job_dir: Path,
                            session_id: str) -> str:
-    """If *must_gather_base_dir* points to an archive file, extract it into
-    the job's ``input/`` directory and return the resolved root path.
-    If it's already a directory, return it unchanged."""
+    """Download the archive from the API, extract it into the job's
+    ``input/`` directory and return the resolved root path."""
+    _write_status(job_dir, {
+        "session_id": session_id,
+        "status": "running",
+        "phase": "downloading",
+        "progress": 1,
+        "message": "Downloading input archive from API...",
+    })
+    input_dir = job_dir / "input"
+    archive_path = worker_comms.download_input(session_id, input_dir)
+    must_gather_base_dir = str(archive_path)
+
     p = Path(must_gather_base_dir)
     if p.is_dir():
         return must_gather_base_dir
@@ -135,20 +120,28 @@ def _maybe_extract_archive(must_gather_base_dir: str, job_dir: Path,
     extract_dir.mkdir(parents=True, exist_ok=True)
 
     size_gb = p.stat().st_size / (1024**3)
-    print(f"[Worker] Extracting archive {p.name} ({size_gb:.2f} GB) via CLI tar+pigz …")
+    print(f"[Worker] Extracting archive {p.name} ({size_gb:.2f} GB) …")
     name_lower = p.name.lower()
 
     if name_lower.endswith(".zip"):
         with zipfile.ZipFile(p, "r") as zf:
             zf.extractall(extract_dir)
     else:
-        if name_lower.endswith((".tar.gz", ".tgz")):
-            cmd = ["tar", "xf", str(p), "-C", str(extract_dir), "-I", "pigz"]
-        elif name_lower.endswith(".tar.bz2"):
-            cmd = ["tar", "xjf", str(p), "-C", str(extract_dir)]
-        else:
-            cmd = ["tar", "xf", str(p), "-C", str(extract_dir)]
-        subprocess.run(cmd, check=True)
+        try:
+            if name_lower.endswith((".tar.gz", ".tgz")):
+                if shutil.which("pigz"):
+                    cmd = ["tar", "xf", str(p), "-C", str(extract_dir), "-I", "pigz"]
+                else:
+                    cmd = ["tar", "xzf", str(p), "-C", str(extract_dir)]
+            elif name_lower.endswith(".tar.bz2"):
+                cmd = ["tar", "xjf", str(p), "-C", str(extract_dir)]
+            else:
+                cmd = ["tar", "xf", str(p), "-C", str(extract_dir)]
+            subprocess.run(cmd, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"[Worker] CLI extraction failed ({exc}); falling back to Python tarfile")
+            with tarfile.open(p, "r:*") as tf:
+                tf.extractall(extract_dir)
 
     p.unlink(missing_ok=True)
     resolved = _resolve_root(extract_dir)
@@ -163,7 +156,8 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
 
     job_results_dir = job_dir / "results"
     job_results_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = get_results_dir()
+    set_results_dir(job_results_dir)
+    set_memory_file_path(job_dir / "agent_memory.json")
 
     def progress_callback(event_type, message="", data=None):
         phase_map = {
@@ -227,8 +221,8 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
         output_session_id=session_id,
     )
 
-    _copy_results_to_job(results_dir, job_results_dir)
-    _copy_agent_memory_to_job(job_dir)
+    _upload_results(job_results_dir)
+    _upload_agent_memory()
 
     orch_status = result.get("status", "error")
     if orch_status != "error":
@@ -252,24 +246,20 @@ def _run_analyze(session_id: str, user_query: str, must_gather_base_dir: str,
         })
 
 
-def _restore_agent_memory_from_pvc(job_dir: Path) -> None:
-    """Restore agent_memory.json from the shared PVC into the worker's local
-    Config/ so the OrchestratorAgent can find the session from the first pass."""
-    src = job_dir / "agent_memory.json"
-    if src.exists():
-        dest = get_memory_file_path()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+def _restore_agent_memory() -> None:
+    """Download agent_memory.json from the API for deepening rounds."""
+    dest = get_memory_file_path()
+    worker_comms.download_agent_memory(_SESSION_ID, dest)
 
 
 def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
                    must_gather_base_dir: str, job_dir: Path) -> None:
     """Run a feedback / deepening round."""
-    _restore_agent_memory_from_pvc(job_dir)
-
     job_results_dir = job_dir / "results"
     job_results_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = get_results_dir()
+    set_results_dir(job_results_dir)
+    set_memory_file_path(job_dir / "agent_memory.json")
+    _restore_agent_memory()
 
     def progress_callback(event_type, message="", data=None):
         phase_map = {
@@ -324,8 +314,8 @@ def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
         progress_callback=progress_callback,
     )
 
-    _copy_results_to_job(results_dir, job_results_dir)
-    _copy_agent_memory_to_job(job_dir)
+    _upload_results(job_results_dir)
+    _upload_agent_memory()
 
     if isinstance(result, dict) and result.get("status") == "error":
         _write_status(job_dir, {
@@ -351,20 +341,34 @@ def _run_deepening(session_id: str, orch_session_id: str, feedback_text: str,
             _cleanup_input(job_dir, session_id)
 
 
-def _bootstrap_gcp_credentials() -> None:
-    try:
-        from llm_rca_agent import ensure_gcp_credentials_from_config
-        cred_path = ensure_gcp_credentials_from_config()
-        if cred_path:
-            print(f"GCP credentials ready at {cred_path}", flush=True)
-    except Exception as exc:
-        print(f"Warning: Could not bootstrap GCP credentials from config: {exc}", flush=True)
+class _TeeWriter:
+    """Tee stdout to a local log file, the terminal, and the API console buffer."""
+
+    def __init__(self, log_file, original_stdout, console_buffer):
+        self._log_file = log_file
+        self._original = original_stdout
+        self._console_buffer = console_buffer
+
+    def write(self, text):
+        if self._original:
+            self._original.write(text)
+        if self._log_file:
+            self._log_file.write(text)
+            self._log_file.flush()
+        if self._console_buffer:
+            self._console_buffer.write(text)
+
+    def flush(self):
+        if self._original:
+            self._original.flush()
+        if self._log_file:
+            self._log_file.flush()
 
 
 def main() -> None:
-    global _OWNER
-    _bootstrap_gcp_credentials()
+    global _OWNER, _SESSION_ID
     session_id = _read_env("SESSION_ID")
+    _SESSION_ID = session_id
     user_query = _read_env("USER_QUERY")
     job_dir = Path(_read_env("JOB_DIR"))
     must_gather_base_dir = _read_env("MUST_GATHER_BASE_DIR")
@@ -378,12 +382,15 @@ def main() -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = None
+    console_buffer = None
     original_stdout = sys.stdout
     try:
         log_path = job_dir / "results" / "workflow_console.txt"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "a", encoding="utf-8")
-        sys.stdout = _TeeWriter(log_file, original_stdout)
+
+        console_buffer = worker_comms.ConsoleBuffer(session_id)
+        sys.stdout = _TeeWriter(log_file, original_stdout, console_buffer)
     except Exception:
         pass
 
@@ -412,6 +419,11 @@ def main() -> None:
         sys.exit(1)
     finally:
         sys.stdout = original_stdout
+        if console_buffer:
+            try:
+                console_buffer.close()
+            except Exception:
+                pass
         if log_file:
             try:
                 log_file.close()
