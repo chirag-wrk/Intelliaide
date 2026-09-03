@@ -126,11 +126,10 @@ def _get_active_jobs_by_namespace() -> dict[str, list]:
 # ---- Namespace pool operations ----
 
 def claim_namespace(session_id: str) -> str:
-    """Pick an available namespace from the pool for a session.
+    """Pick a namespace from the pool for a session.
 
-    Looks at live K8s Jobs to determine which namespaces are busy.
     If the session already has an active Job, returns that namespace.
-    Raises RuntimeError if the pool is exhausted.
+    Otherwise picks the namespace with the fewest active Jobs.
     """
     _init()
     pool = _load_pool()
@@ -142,16 +141,10 @@ def claim_namespace(session_id: str) -> str:
             if sid == session_id[:63]:
                 return ns
 
-    in_use = set(active_by_ns.keys())
-    for ns in pool:
-        if ns not in in_use:
-            logger.info("Claimed namespace %s for session %s", ns, session_id)
-            return ns
-
-    raise RuntimeError(
-        f"No available namespaces in pool (pool size={len(pool)}, "
-        f"in-use={len(in_use)}). Wait for a running job to complete."
-    )
+    chosen = min(pool, key=lambda ns: len(active_by_ns.get(ns, [])))
+    logger.info("Claimed namespace %s for session %s (active jobs: %d)",
+                chosen, session_id, len(active_by_ns.get(chosen, [])))
+    return chosen
 
 
 def release_namespace(session_id: str) -> None:
