@@ -11,7 +11,7 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: ["gcp-credentials", "intelliaide-system-app-config"]
-    verbs: ["get", "update"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create"]

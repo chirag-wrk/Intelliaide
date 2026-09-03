@@ -270,10 +270,7 @@ def _copy_secrets_to_namespace(target_namespace: str) -> None:
                         secret_name, target_namespace)
         except ApiException as exc:
             if exc.status == 409:
-                _jobs_core_v1.replace_namespaced_secret(
-                    name=secret_name, namespace=target_namespace, body=target,
-                )
-                logger.info("Updated secret %s in namespace %s",
+                logger.info("Secret %s already exists in namespace %s, reusing",
                             secret_name, target_namespace)
             else:
                 raise
