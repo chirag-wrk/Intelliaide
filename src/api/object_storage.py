@@ -108,6 +108,56 @@ def upload_archive(session_id: str, local_path: Path) -> str:
     return uri
 
 
+def upload_archive_key(session_id: str, key: str, local_path: Path) -> str:
+    """Upload a local file to ``{session_id}/{key}`` via a filename-based upload.
+
+    Unlike :func:`write_bytes`, this streams from disk rather than buffering the
+    whole file in memory, so it is safe for large archives.
+    Returns a ``s3://`` or ``gs://`` URI of the uploaded object.
+    """
+    blob_name = f"{session_id}/{key}"
+    bucket = _bucket_name()
+
+    if OBJECT_STORAGE_BACKEND == "gcs":
+        blob = _gcs_bucket().blob(blob_name)
+        blob.upload_from_filename(str(local_path), timeout=1800)
+        return f"gs://{bucket}/{blob_name}"
+    else:
+        _get_s3_client().upload_file(str(local_path), bucket, blob_name)
+        return f"s3://{bucket}/{blob_name}"
+
+
+def download_key_to_file(session_id: str, key: str, dest: Path,
+                         chunk_size: int = 8 * 1024 * 1024) -> bool:
+    """Stream ``{session_id}/{key}`` to a local file. Returns False if missing."""
+    blob_key = f"{session_id}/{key}"
+
+    if OBJECT_STORAGE_BACKEND == "gcs":
+        from google.cloud.exceptions import NotFound
+        blob = _gcs_bucket().blob(blob_key)
+        try:
+            blob.download_to_filename(str(dest))
+            return True
+        except NotFound:
+            return False
+    else:
+        from botocore.exceptions import ClientError
+        s3 = _get_s3_client()
+        try:
+            with open(dest, "wb") as f:
+                body = s3.get_object(Bucket=_bucket_name(), Key=blob_key)["Body"]
+                while True:
+                    data = body.read(chunk_size)
+                    if not data:
+                        break
+                    f.write(data)
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                return False
+            raise
+
+
 def stream_download(session_id: str, chunk_size: int = 8 * 1024 * 1024) -> Iterator[bytes]:
     """Yield the archive for *session_id* as a stream of byte chunks."""
     prefix = f"{session_id}/"
@@ -366,3 +416,30 @@ def list_session_prefixes(limit: int = 1000) -> list[str]:
         bucket = _bucket_name()
         resp = s3.list_objects_v2(Bucket=bucket, Prefix="", Delimiter="/", MaxKeys=limit)
         return [p["Prefix"].rstrip("/") for p in resp.get("CommonPrefixes", [])]
+
+
+def list_keys(session_id: str, key_prefix: str = "", limit: int = 1000) -> list[str]:
+    """Return object keys (relative to *session_id*) under ``{session_id}/{key_prefix}``.
+
+    The returned keys are stripped of the ``{session_id}/`` prefix so they can be
+    passed straight back into :func:`read_bytes` / :func:`read_json` etc.
+    """
+    full_prefix = f"{session_id}/{key_prefix}"
+    strip = f"{session_id}/"
+
+    if OBJECT_STORAGE_BACKEND == "gcs":
+        blobs = _get_gcs_client().list_blobs(
+            GCS_BUCKET_NAME, prefix=full_prefix, max_results=limit,
+        )
+        return [b.name[len(strip):] for b in blobs if b.name.startswith(strip)]
+    else:
+        s3 = _get_s3_client()
+        bucket = _bucket_name()
+        keys: list[str] = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix,
+                                       PaginationConfig={"MaxItems": limit}):
+            for obj in page.get("Contents", []):
+                if obj["Key"].startswith(strip):
+                    keys.append(obj["Key"][len(strip):])
+        return keys
