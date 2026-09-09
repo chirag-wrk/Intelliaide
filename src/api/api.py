@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 
 # Import after path setup
 from orchestrator_agent import OrchestratorAgent, clear_agent_memory
-from app_paths import get_config_path, get_memory_file_path
+from app_paths import get_config_path, get_memory_file_path, set_memory_file_path
 from utils.utils import create_zip_from_files, create_zip_from_buffers
 from utils.causal_dag_image import render_causal_dag_png
 from utils.rca_doc_export import append_rca_stage_bundle_entries
@@ -486,16 +486,21 @@ def _resolve_session_id(session_id: str | None) -> str | None:
 
 
 def _restore_agent_memory(session_id: str) -> bool:
-    """Copy agent_memory.json from GCS into the API pod's Config/ directory.
+    """Copy agent_memory.json from GCS into a writable per-session location.
+
+    The API pod's image dir (/app/config) is read-only under OpenShift's
+    arbitrary UID, so — mirroring the worker (worker.py) — redirect the agent
+    memory file to a writable temp dir before writing. This also makes the
+    subsequent OrchestratorAgent reads/writes target the writable copy.
 
     Returns True if the file was restored.
     """
 
-    dest = get_memory_file_path()
+    dest = Path(tempfile.gettempdir()) / f"agent_memory_{session_id}.json"
+    set_memory_file_path(dest)
     data = object_storage.read_bytes(session_id, "agent_memory.json")
     if not data:
         return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     logger.info("Restored agent_memory.json from GCS for session %s", session_id)
     return True
