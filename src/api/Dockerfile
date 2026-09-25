@@ -1,7 +1,8 @@
 FROM registry.access.redhat.com/ubi9/python-311:latest
 
 USER root
-RUN dnf install -y curl gnupg2 pigz ca-certificates && \
+# UBI9 python-311 already includes curl-minimal, gnupg2, and ca-certificates.
+RUN dnf install -y pigz && \
     tee /etc/yum.repos.d/google-cloud-sdk.repo <<'EOF'
 [google-cloud-cli]
 name=Google Cloud CLI
