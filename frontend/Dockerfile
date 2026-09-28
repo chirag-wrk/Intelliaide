@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/nodejs-20:latest AS build
+FROM registry.access.redhat.com/ubi9/nodejs-22:latest AS build
 
 USER root
 WORKDIR /app
@@ -10,10 +10,12 @@ RUN npm run build
 FROM registry.access.redhat.com/ubi9/nginx-124:latest
 
 USER root
-COPY --from=build /app/dist /usr/share/nginx/html
+RUN mkdir -p /opt/intelliaide/www /licenses
+COPY --from=build /app/dist /opt/intelliaide/www
 COPY nginx.conf /etc/nginx/conf.d/default.conf
-RUN chgrp -R 0 /usr/share/nginx/html /etc/nginx/conf.d && \
-    chmod -R g+rwX /usr/share/nginx/html && \
+COPY LICENSE /licenses/
+RUN chgrp -R 0 /opt/intelliaide/www /etc/nginx/conf.d /licenses && \
+    chmod -R g+rwX /opt/intelliaide/www /licenses && \
     chmod g+rw /etc/nginx/conf.d/default.conf
 
 USER 101
