@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 
 # Import after path setup
 from orchestrator_agent import OrchestratorAgent, clear_agent_memory
-from app_paths import get_config_path, get_memory_file_path
+from app_paths import get_config_path, get_memory_file_path, set_memory_file_path
 from utils.utils import create_zip_from_files, create_zip_from_buffers
 from utils.causal_dag_image import render_causal_dag_png
 from utils.rca_doc_export import append_rca_stage_bundle_entries
@@ -55,7 +55,61 @@ import object_storage
 
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path("/tmp/rca_uploads")
+# Reserved object-storage "session" prefixes for state that exists *before* a
+# real analysis session_id is minted. Using object storage (instead of a
+# pod-local /tmp dir) lets any API replica serve follow-up requests — e.g. an
+# upload landing on pod1 and the subsequent /analyze landing on pod2.
+_UPLOADS_PREFIX = "_uploads"
+_DOWNLOADS_PREFIX = "_downloads"
+
+
+def _staged_upload_keys(local_file_id: str) -> list[str]:
+    """Return object keys for a staged upload (``{local_file_id}.<suffix>``)."""
+    return [
+        k for k in object_storage.list_keys(_UPLOADS_PREFIX, local_file_id)
+        if k.startswith(f"{local_file_id}.")
+    ]
+
+
+def _write_staged_upload_from_file(local_file_id: str, suffix: str, src: Path) -> None:
+    """Stream a local archive file into object storage under the uploads prefix."""
+    object_storage.upload_archive_key(
+        _UPLOADS_PREFIX, f"{local_file_id}{suffix}", src,
+    )
+
+
+def _fetch_staged_upload(local_file_id: str, dest_dir: Path) -> Path:
+    """Download a staged upload from object storage into *dest_dir*.
+
+    Returns the local path. Raises FileNotFoundError if the upload is missing.
+    """
+    keys = _staged_upload_keys(local_file_id)
+    if not keys:
+        raise FileNotFoundError(f"Upload {local_file_id} not found")
+    key = sorted(keys)[0]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / Path(key).name
+    if not object_storage.download_key_to_file(_UPLOADS_PREFIX, key, dest):
+        raise FileNotFoundError(f"Upload {local_file_id} not found")
+    return dest
+
+
+def _delete_staged_upload(local_file_id: str) -> None:
+    """Remove a staged upload from object storage (best effort)."""
+    try:
+        object_storage.delete_prefix(_UPLOADS_PREFIX, local_file_id)
+    except Exception:
+        logger.warning("Failed to delete staged upload %s", local_file_id, exc_info=True)
+
+
+# ── Background download tracking (object-storage backed) ─────────────────────
+
+def _write_dl_status(download_id: str, data: dict) -> None:
+    object_storage.write_json(_DOWNLOADS_PREFIX, f"{download_id}.json", data)
+
+
+def _read_dl_status(download_id: str) -> dict | None:
+    return object_storage.read_json(_DOWNLOADS_PREFIX, f"{download_id}.json")
 
 ADMIN_USERS: set[str] = {
     u.strip().lower()
@@ -242,8 +296,6 @@ def _hydra_list_mg_attachments(case_number: str) -> list[dict]:
     Each entry: {uuid, filename, size_bytes, created}.
     Handles HYDRA_STUB_DIR for offline testing.
     """
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
     # ── Offline stub ──────────────────────────────────────────────────────────
     if HYDRA_STUB_DIR:
         stub_path = Path(HYDRA_STUB_DIR)
@@ -295,13 +347,11 @@ def _hydra_list_mg_attachments(case_number: str) -> list[dict]:
 
 
 def _hydra_download_specific(case_number: str, attachment_uuid: str, filename: str) -> tuple[str, str]:
-    """Download one attachment by UUID into UPLOAD_DIR.
+    """Download one attachment by UUID and stage it in object storage.
 
     Returns (local_file_id, filename).
     In stub mode, attachment_uuid is the filename inside HYDRA_STUB_DIR.
     """
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
     # ── Offline stub ──────────────────────────────────────────────────────────
     if HYDRA_STUB_DIR:
         stub_path = Path(HYDRA_STUB_DIR)
@@ -310,50 +360,26 @@ def _hydra_download_specific(case_number: str, attachment_uuid: str, filename: s
             raise RuntimeError(f"Stub file '{attachment_uuid}' not found in HYDRA_STUB_DIR.")
         suffix = _archive_suffix(src.name)
         local_file_id = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        dest = UPLOAD_DIR / f"{local_file_id}{suffix}"
-        shutil.copy2(str(src), str(dest))
-        logger.info("[Stub] %s → %s", src.name, dest)
+        _write_staged_upload_from_file(local_file_id, suffix, src)
+        logger.info("[Stub] %s → %s/%s%s", src.name, _UPLOADS_PREFIX, local_file_id, suffix)
         return local_file_id, src.name
 
     # ── Live Hydra ────────────────────────────────────────────────────────────
     token = _hydra_fetch_token()
     safe_name = re.sub(r'[^\w.\-]', '_', filename) or f"must-gather-{case_number}.tar.gz"
-    tmp_dir = Path(f"/tmp/case_{case_number}")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    output_path = str(tmp_dir / safe_name)
-    _hydra_download(case_number, attachment_uuid, token, output_path)
+    # Scratch dir is per-request and cleaned up immediately; the durable copy
+    # lives in object storage so any API replica can serve the follow-up /analyze.
+    with tempfile.TemporaryDirectory(prefix=f"case_{case_number}_") as tmp_dir:
+        output_path = str(Path(tmp_dir) / safe_name)
+        _hydra_download(case_number, attachment_uuid, token, output_path)
 
-    downloaded = Path(output_path)
-    suffix = _archive_suffix(downloaded.name)
-    local_file_id = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    dest = UPLOAD_DIR / f"{local_file_id}{suffix}"
-    shutil.move(str(downloaded), str(dest))
-    logger.info("[Hydra] case %s uuid %s → %s", case_number, attachment_uuid, dest)
+        downloaded = Path(output_path)
+        suffix = _archive_suffix(downloaded.name)
+        local_file_id = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        _write_staged_upload_from_file(local_file_id, suffix, downloaded)
+    logger.info("[Hydra] case %s uuid %s → %s/%s%s",
+                case_number, attachment_uuid, _UPLOADS_PREFIX, local_file_id, suffix)
     return local_file_id, filename
-
-
-# ── Background download tracking (file-based) ─
-_DOWNLOAD_STATUS_DIR = Path("/tmp/rca_download_status")
-_DOWNLOAD_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _dl_status_path(download_id: str) -> Path:
-    return _DOWNLOAD_STATUS_DIR / f"{download_id}.json"
-
-
-def _write_dl_status(download_id: str, data: dict) -> None:
-    p = _dl_status_path(download_id)
-    p.write_text(json.dumps(data), encoding="utf-8")
-
-
-def _read_dl_status(download_id: str) -> dict | None:
-    p = _dl_status_path(download_id)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 def _start_background_download(
@@ -460,16 +486,21 @@ def _resolve_session_id(session_id: str | None) -> str | None:
 
 
 def _restore_agent_memory(session_id: str) -> bool:
-    """Copy agent_memory.json from GCS into the API pod's Config/ directory.
+    """Copy agent_memory.json from GCS into a writable per-session location.
+
+    The API pod's image dir (/app/config) is read-only under OpenShift's
+    arbitrary UID, so — mirroring the worker (worker.py) — redirect the agent
+    memory file to a writable temp dir before writing. This also makes the
+    subsequent OrchestratorAgent reads/writes target the writable copy.
 
     Returns True if the file was restored.
     """
 
-    dest = get_memory_file_path()
+    dest = Path(tempfile.gettempdir()) / f"agent_memory_{session_id}.json"
+    set_memory_file_path(dest)
     data = object_storage.read_bytes(session_id, "agent_memory.json")
     if not data:
         return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     logger.info("Restored agent_memory.json from GCS for session %s", session_id)
     return True
@@ -584,21 +615,6 @@ def _extract_archive_to(archive_path: Path, extract_base: Path) -> str:
     except tarfile.TarError:
         pass
     raise ValueError(f"Unrecognised archive format: {archive_path.name}")
-
-
-def _extract_local_upload(local_file_id: str, job_input_dir: Path) -> str:
-    """Extract a locally saved upload archive into the job's input directory.
-
-    Deletes the archive file after extraction.
-    """
-    candidates = sorted(UPLOAD_DIR.glob(f"{local_file_id}.*"))
-    if not candidates:
-        raise FileNotFoundError(f"Upload {local_file_id} not found")
-    archive_path = candidates[0]
-    try:
-        return _extract_archive_to(archive_path, job_input_dir)
-    finally:
-        archive_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -728,10 +744,12 @@ def admin_delete(session_id: str, request: Request):
 
 @app.post("/upload-must-gather")
 async def upload_must_gather(file: UploadFile = File(...)):
-    """Receive a must-gather archive from the frontend and save it locally.
+    """Receive a must-gather archive from the frontend and stage it in object storage.
 
     Accepted formats: .zip, .tar.gz
 
+    The archive is stored under a shared object-storage prefix (not a pod-local
+    disk) so that a subsequent /analyze can be served by any API replica.
     Returns a local_file_id that the client passes to /analyze.
     """
     if not file.filename:
@@ -744,18 +762,19 @@ async def upload_must_gather(file: UploadFile = File(...)):
             detail=f"Unsupported file type. Accepted formats: {', '.join(_ALLOWED_ARCHIVE_SUFFIXES)}",
         )
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     local_file_id = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    local_path = UPLOAD_DIR / f"{local_file_id}{suffix}"
 
+    # Stream to a per-request temp file, then hand the file off to object
+    # storage (avoids buffering multi-GB archives entirely in memory).
     try:
-        with open(local_path, "wb") as f:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
             while chunk := await file.read(8 * 1024 * 1024):
-                f.write(chunk)
+                tmp.write(chunk)
+            tmp.flush()
+            _write_staged_upload_from_file(local_file_id, suffix, Path(tmp.name))
     except Exception as e:
-        if local_path.exists():
-            local_path.unlink(missing_ok=True)
-        logger.exception("Failed to save uploaded must-gather locally")
+        _delete_staged_upload(local_file_id)
+        logger.exception("Failed to stage uploaded must-gather to object storage")
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
     return {"local_file_id": local_file_id, "filename": file.filename}
@@ -779,30 +798,36 @@ def analyze(request: AnalyzeRequest, req: Request = None):
 
     owner = (_get_authenticated_user(req) if req else "") or (request.owner or "").strip() or "unknown"
 
-    archive_path = None
-    must_gather_base_dir = ""
-    if local_file_id:
-        candidates = sorted(UPLOAD_DIR.glob(f"{local_file_id}.*"))
-        if not candidates:
-            raise HTTPException(status_code=404, detail=f"Upload '{local_file_id}' not found or expired")
-        archive_path = candidates[0]
-        must_gather_base_dir = str(archive_path)
-    try:
-        job_runner.create_analysis_job(
-            session_id=session_id,
-            user_query=user_query,
-            must_gather_base_dir=must_gather_base_dir,
-            owner=owner,
-            archive_local_path=archive_path,
-        )
-    except Exception as e:
-        logger.exception("Failed to create K8s Job for session %s", session_id)
-        raise HTTPException(status_code=500, detail=f"Failed to create analysis job: {e}")
-    if archive_path and archive_path.exists():
+    # The staged upload lives in object storage (any replica can read it).
+    # Pull it into a per-request temp dir; create_analysis_job re-uploads it
+    # under the real session_id for the worker to fetch.
+    with tempfile.TemporaryDirectory(prefix="analyze_") as staging_dir:
+        archive_path = None
+        must_gather_base_dir = ""
+        if local_file_id:
+            try:
+                archive_path = _fetch_staged_upload(local_file_id, Path(staging_dir))
+            except FileNotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Upload '{local_file_id}' not found or expired",
+                )
+            must_gather_base_dir = str(archive_path)
         try:
-            archive_path.unlink()
-        except Exception:
-            pass
+            job_runner.create_analysis_job(
+                session_id=session_id,
+                user_query=user_query,
+                must_gather_base_dir=must_gather_base_dir,
+                owner=owner,
+                archive_local_path=archive_path,
+            )
+        except Exception as e:
+            logger.exception("Failed to create K8s Job for session %s", session_id)
+            raise HTTPException(status_code=500, detail=f"Failed to create analysis job: {e}")
+
+    # Job created successfully — drop the staged upload from object storage.
+    if local_file_id:
+        _delete_staged_upload(local_file_id)
 
     return AnalyzeResponse(
         status="started",
@@ -1987,8 +2012,6 @@ def _schedule_remote_cleanup(session_id: str) -> None:
 @app.on_event("startup")
 async def _startup_cross_cluster():
     """Initialize cross-cluster features on startup."""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
     try:
         _reconcile_running_sessions()
     except Exception:
