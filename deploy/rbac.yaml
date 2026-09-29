@@ -1,0 +1,36 @@
+# Apply once per namespace before deploying the ClowdApp template.
+# Grants the API pod permission to spawn RCA worker Jobs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: intelliaide-api
+  labels:
+    app: intelliaide
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: intelliaide-job-manager
+  labels:
+    app: intelliaide
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: intelliaide-api-job-manager
+  labels:
+    app: intelliaide
+subjects:
+  - kind: ServiceAccount
+    name: intelliaide-api
+roleRef:
+  kind: Role
+  name: intelliaide-job-manager
+  apiGroup: rbac.authorization.k8s.io
