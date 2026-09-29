@@ -1,0 +1,339 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: intelliaide
+  annotations:
+    description: IntelliAide API + frontend as a single ClowdApp (both deployments Clowder-managed)
+objects:
+  - apiVersion: cloud.redhat.com/v1alpha1
+    kind: ClowdApp
+    metadata:
+      name: intelliaide
+      labels:
+        app: intelliaide
+    spec:
+      envName: ${ENV_NAME}
+      deployments:
+        - name: api
+          replicas: 1
+          k8sAccessLevel: edit
+          deploymentStrategy:
+            privateStrategy: Recreate
+          podSpec:
+            serviceAccountName: intelliaide-api
+            image: ${API_IMAGE}:${API_TAG}
+            envFrom:
+              - configMapRef:
+                  name: intelliaide-api-config
+            env:
+              - name: GOOGLE_APPLICATION_CREDENTIALS
+                value: /secrets/gcloud/application_default_credentials.json
+              - name: GOOGLE_CLOUD_PROJECT
+                value: itpc-gcp-hcm-pe-eng-claude
+              - name: CLOUDSDK_CONFIG
+                value: /tmp/gcloud
+              - name: HOME
+                value: /tmp
+              - name: WORKER_IMAGE
+                value: ${API_IMAGE}:${API_TAG}
+              - name: SHARED_PVC_MOUNT
+                value: /shared
+              - name: SHARED_PVC_CLAIM_NAME
+                value: must-gather-shared
+              - name: K8S_NAMESPACE
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.namespace
+              - name: GCP_SECRET_NAME
+                value: gcloud-adc-secret
+              - name: APP_CONFIG_SECRET_NAME
+                value: must-gather-app-config
+              - name: JOBS_CLUSTER_KUBECONFIG
+                value: /secrets/kubeconfig/kubeconfig
+              - name: API_CALLBACK_URL
+                value: http://intelliaide-api-http:8000
+              - name: GCS_BUCKET_NAME
+                value: ${GCS_BUCKET_NAME}
+              - name: NAMESPACE_POOL_FILE
+                value: /config/namespace-pool/namespaces.json
+              # NOTE: AUTH_BYPASS / DEV_USER are not read by src/api (identity comes
+              # solely from the X-Forwarded-User header, set by crcauth/oauth-proxy
+              # in stage/prod). Kept for backward compat with other deploy paths
+              # (see k8s/api-deployment.yaml); no effect via this template.
+              - name: AUTH_BYPASS
+                value: ${AUTH_BYPASS}
+              - name: DEV_USER
+                value: ${EPHEMERAL_USER}
+              - name: ADMIN_USERS
+                value: kubeadmin,kube:admin
+            volumeMounts:
+              - name: gcloud-adc
+                mountPath: /secrets/gcloud
+                readOnly: true
+              - name: jobs-kubeconfig
+                mountPath: /secrets/kubeconfig
+                readOnly: true
+              - name: namespace-pool
+                mountPath: /config/namespace-pool
+                readOnly: true
+              - name: shared-data
+                mountPath: /shared
+              - name: tmp-dir
+                mountPath: /tmp
+              - name: workspace-dir
+                mountPath: /workspace
+              - name: app-config
+                mountPath: /app/Config/config.json
+                subPath: config.json
+                readOnly: true
+            resources:
+              requests:
+                cpu: 250m
+                memory: 1Gi
+              limits:
+                cpu: 2000m
+                memory: 2Gi
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              initialDelaySeconds: 15
+              periodSeconds: 30
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              initialDelaySeconds: 5
+              periodSeconds: 10
+            volumes:
+              - name: gcloud-adc
+                secret:
+                  secretName: gcloud-adc-secret
+              - name: jobs-kubeconfig
+                configMap:
+                  name: intelliaide-jobs-kubeconfig
+              - name: namespace-pool
+                configMap:
+                  name: intelliaide-namespace-pool
+              - name: shared-data
+                persistentVolumeClaim:
+                  claimName: must-gather-shared
+              - name: tmp-dir
+                emptyDir:
+                  sizeLimit: 10Gi
+              - name: workspace-dir
+                emptyDir:
+                  sizeLimit: 5Gi
+              - name: app-config
+                secret:
+                  secretName: must-gather-app-config
+          webServices:
+            private:
+              enabled: true
+              port: 8000
+
+        - name: frontend
+          replicas: 1
+          webServices:
+            private:
+              enabled: true
+              port: 10000
+          podSpec:
+            image: ${FRONTEND_IMAGE}:${FRONTEND_TAG}
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+            livenessProbe:
+              httpGet:
+                path: /
+                port: 10000
+              initialDelaySeconds: 5
+              periodSeconds: 30
+            readinessProbe:
+              httpGet:
+                path: /
+                port: 10000
+              initialDelaySeconds: 3
+              periodSeconds: 10
+            volumeMounts:
+              - name: nginx-config
+                mountPath: /etc/nginx/conf.d/default.conf
+                subPath: nginx.conf
+                readOnly: true
+            volumes:
+              - name: nginx-config
+                configMap:
+                  name: intelliaide-frontend-nginx
+
+  # Route kept as template object: Clowder does not auto-create Routes for
+  # deployments without webServices.public.
+  - apiVersion: route.openshift.io/v1
+    kind: Route
+    metadata:
+      name: intelliaide-frontend
+      labels:
+        app: intelliaide
+      annotations:
+        haproxy.router.openshift.io/proxy-body-size: 2g
+        haproxy.router.openshift.io/timeout: 1800s
+    spec:
+      to:
+        kind: Service
+        name: intelliaide-frontend
+      port:
+        targetPort: 10000
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: intelliaide-api-config
+      labels:
+        app: intelliaide
+    data:
+      VERIFY_SSL: "true"
+
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: intelliaide-namespace-pool
+      labels:
+        app: intelliaide
+    data:
+      namespaces.json: |
+        ["${NAMESPACE}"]
+
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: intelliaide-jobs-kubeconfig
+      labels:
+        app: intelliaide
+    data:
+      kubeconfig: |
+        apiVersion: v1
+        kind: Config
+        clusters:
+        - cluster:
+            certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            server: https://kubernetes.default.svc
+          name: local
+        contexts:
+        - context:
+            cluster: local
+            user: local
+          name: local
+        current-context: local
+        users:
+        - name: local
+          user:
+            tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: intelliaide-frontend-nginx
+      labels:
+        app: intelliaide
+    data:
+      nginx.conf: |
+        server {
+            listen 10000;
+            root /opt/intelliaide/www;
+            index index.html;
+
+            client_max_body_size 2G;
+            client_body_timeout 600s;
+
+            location /api/ {
+                proxy_pass http://intelliaide-api-http:8000/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-User $http_x_forwarded_user;
+                proxy_set_header X-Forwarded-Email $http_x_forwarded_email;
+                proxy_set_header X-Forwarded-Access-Token $http_x_forwarded_access_token;
+                proxy_read_timeout 1800s;
+                proxy_send_timeout 1800s;
+                proxy_connect_timeout 10s;
+                proxy_request_buffering off;
+            }
+
+            location / {
+                try_files $uri $uri/ /index.html;
+            }
+        }
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: intelliaide-api-http
+      labels:
+        app: intelliaide
+    spec:
+      selector:
+        pod: intelliaide-api
+      ports:
+        - name: http
+          port: 8000
+          targetPort: 8000
+          protocol: TCP
+
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: must-gather-shared
+      labels:
+        app: intelliaide
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: ${STORAGE_CLASS}
+      resources:
+        requests:
+          storage: ${PVC_SIZE}
+
+parameters:
+  - name: ENV_NAME
+    displayName: Clowder environment name
+    description: Must match a ClowdEnvironment resource (oc get env), e.g. env-ephemeral-8fbkht
+    required: true
+  - name: API_IMAGE
+    displayName: Backend image repository
+    value: quay.io/redhat-services-prod/intelliaide-tenant/intelliaide/intelliaide-api
+  - name: API_TAG
+    displayName: Backend image tag
+    value: latest
+    description: Konflux release tag (git short SHA) from quay.io/redhat-services-prod/intelliaide-tenant/intelliaide/intelliaide-api
+  - name: FRONTEND_IMAGE
+    displayName: Frontend image repository
+    value: quay.io/redhat-services-prod/intelliaide-tenant/intelliaide/intelliaide-frontend
+  - name: FRONTEND_TAG
+    displayName: Frontend image tag
+    value: latest
+  - name: PVC_SIZE
+    displayName: Shared PVC size
+    value: 1Gi
+  - name: STORAGE_CLASS
+    displayName: Storage class (empty for cluster default)
+    value: gp3
+  - name: AUTH_BYPASS
+    displayName: Skip API auth checks (use true for ephemeral)
+    value: "true"
+  - name: EPHEMERAL_USER
+    displayName: Username injected for ephemeral auth bypass
+    value: dev-user
+  - name: NAMESPACE
+    displayName: Target namespace for worker Jobs
+    description: Set to the ephemeral namespace (e.g. ephemeral-ykrvuq). Used in the namespace pool ConfigMap.
+    required: true
+  - name: GCS_BUCKET_NAME
+    displayName: GCS bucket for must-gather uploads
+    value: rca-inputs
+    description: Use rca-inputs-stage / rca-inputs-prod for permanent environments
